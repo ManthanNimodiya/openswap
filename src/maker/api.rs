@@ -128,7 +128,8 @@ pub struct MakerServerConfig {
     pub amount_relative_fee_pct: f64,
     /// Time-relative fee percentage.
     pub time_relative_fee_pct: f64,
-    /// Minimum swap amount in satoshis.
+    /// Operator-configured economic minimum swap amount in satoshis.
+    /// Technical fee, dust, and spendability floors are enforced separately.
     pub min_swap_amount: u64,
     /// Required confirmations for funding transactions.
     pub required_confirms: u32,
@@ -232,10 +233,17 @@ impl MakerServerConfig {
             config_map.get("min_swap_amount"),
             default_config.min_swap_amount,
         );
-        let technical_floor = crate::utill::per_output_floor(
-            crate::protocol::ProtocolVersion::Taproot,
-            crate::utill::MIN_FEE_RATE,
-        );
+        let technical_floor = default_config
+            .supported_protocols
+            .iter()
+            .map(|p| crate::utill::per_output_floor(*p, crate::utill::MIN_FEE_RATE))
+            .max()
+            .unwrap_or_else(|| {
+                crate::utill::per_output_floor(
+                    crate::protocol::ProtocolVersion::Legacy,
+                    crate::utill::MIN_FEE_RATE,
+                )
+            });
         if min_swap_amount < technical_floor {
             log::error!(
                 "Configured min_swap_amount {} is below technical dust/fee floor {} sats",
