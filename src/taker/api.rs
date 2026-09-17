@@ -1151,6 +1151,11 @@ impl Taker {
         }
 
         let service_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
+        if service_fee_sats >= send_amount.to_sat() {
+            return Err(TakerError::General(
+                "Cumulative maker fees consume the send amount".into(),
+            ));
+        }
 
         // The headline number is a ceiling, so every cost is priced at its
         // negotiated maximum: all splits delivered at the full input budget

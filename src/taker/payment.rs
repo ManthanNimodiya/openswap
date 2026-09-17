@@ -624,4 +624,25 @@ mod tests {
         assert!(Taker::validate_offer(&offer, 0, Amount::from_sat(2000)).is_ok());
 >>>>>>> b35a8c2e (feat(maker): derive minimum swap amount from fees and dust floor)
     }
+
+    #[test]
+    fn cumulative_route_fees_consuming_send_amount() {
+        // Two hops with 600 sat fee each on 1000 sat send amount:
+        // Individual offers (< 1000) pass validate_offer, but route total (1200 sats) >= send_amount
+        let hops = [terms(600, 0.0, 0.0, 20), terms(600, 0.0, 0.0, 20)];
+        let send_sats = 1000u64;
+        let mut total_fee = 0u64;
+        let mut amount_sats = send_sats as f64;
+
+        for hop in &hops {
+            let fee = hop.base_fee as f64
+                + (amount_sats * hop.amount_relative_fee_pct) / 100.0
+                + (amount_sats * hop.locktime as f64 * hop.time_relative_fee_pct) / 100.0;
+            let fee_sats = fee.ceil() as u64;
+            total_fee += fee_sats;
+            amount_sats = (amount_sats - fee).max(0.0);
+        }
+
+        assert!(total_fee >= send_sats);
+    }
 }
