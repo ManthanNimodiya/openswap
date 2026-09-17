@@ -2138,12 +2138,19 @@ impl Taker {
             )));
         }
 
-        // Base fee must not exceed the send amount (that would consume everything)
-        if offer.base_fee > send_amount.to_sat() {
+        // Full maker fee must not consume or exceed the send amount
+        let maker_fee = crate::protocol::contract::calculate_swap_fee(
+            send_amount.to_sat(),
+            offer.minimum_locktime,
+            offer.base_fee,
+            offer.amount_relative_fee_pct,
+            offer.time_relative_fee_pct,
+        );
+        if maker_fee >= send_amount.to_sat() {
             return Err(TakerError::General(format!(
-                "Maker {} offer base_fee ({} sats) exceeds send amount ({} sats)",
+                "Maker {} total fee ({} sats) consumes send amount ({} sats)",
                 maker_idx,
-                offer.base_fee,
+                maker_fee,
                 send_amount.to_sat()
             )));
         }
