@@ -405,4 +405,57 @@ mod tests {
         let hop = terms(0, 60.0, 0.5, 100);
         assert!(hop_gross_for_net(&hop, 0, 500_000).is_err());
     }
+
+    #[test]
+    fn validate_offer_rejects_fee_exceeding_send_amount() {
+        use bitcoin::hashes::Hash;
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let secret_key = bitcoin::secp256k1::SecretKey::from_slice(&[1u8; 32]).unwrap();
+        let secp_pubkey = bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &secret_key);
+        let pubkey = bitcoin::PublicKey::new(secp_pubkey);
+
+        let bond = crate::wallet::FidelityBond {
+            outpoint: bitcoin::OutPoint {
+                txid: bitcoin::Txid::from_byte_array([2; 32]),
+                vout: 0,
+            },
+            amount: Amount::from_sat(1000),
+            lock_time: bitcoin::locktime::absolute::LockTime::from_height(1000)
+                .expect("valid height locktime"),
+            pubkey,
+            conf_height: Some(1000),
+            is_spent: false,
+            bond_index: 0,
+            tx: None,
+        };
+
+        let cert_hash = bond.generate_cert_hash("127.0.0.1:8000", &pubkey);
+        let msg = bitcoin::secp256k1::Message::from_digest_slice(cert_hash.as_byte_array())
+            .expect("32-byte digest");
+        let cert_sig = secp.sign_ecdsa(&msg, &secret_key);
+
+        let offer = crate::protocol::common_messages::Offer {
+            base_fee: 1000,
+            amount_relative_fee_pct: 10.0,
+            time_relative_fee_pct: 0.1,
+            required_confirms: 1,
+            minimum_locktime: 100,
+            max_size: 1_000_000,
+            min_size: 100,
+            tweakable_point: pubkey,
+            fidelity: crate::protocol::common_messages::FidelityProof {
+                bond,
+                cert_hash,
+                cert_sig,
+            },
+            tweak_chain_code: bitcoin::bip32::ChainCode::from([0u8; 32]),
+        };
+
+        // Send amount of 1,000 sats: base fee 1000 + rel fee 100 + time fee 100 = 1200 >= 1000 -> must error
+        assert!(Taker::validate_offer(&offer, 0, Amount::from_sat(1000)).is_err());
+
+        // Send amount of 2,000 sats: base fee 1000 + rel fee 200 + time fee 200 = 1400 < 2000 -> must pass
+        assert!(Taker::validate_offer(&offer, 0, Amount::from_sat(2000)).is_ok());
+    }
 }
