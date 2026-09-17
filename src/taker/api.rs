@@ -2160,7 +2160,7 @@ impl Taker {
     ) -> Result<(Vec<MakerFeeInfo>, u64), TakerError> {
         let maker_count = makers.len();
         let mut maker_fees = Vec::with_capacity(maker_count);
-        let mut amount_sats = send_amount.to_sat() as f64;
+        let mut amount_sats = send_amount.to_sat();
 
         for (i, (address, protocol, offer_opt)) in makers.iter().enumerate() {
             let locktime =
@@ -2176,8 +2176,8 @@ impl Taker {
             };
 
             let fee = base_fee as f64
-                + (amount_sats * amt_pct) / 100.0
-                + (amount_sats * locktime as f64 * time_pct) / 100.0;
+                + (amount_sats as f64 * amt_pct) / 100.0
+                + (amount_sats as f64 * locktime as f64 * time_pct) / 100.0;
             let fee_sats = fee.ceil() as u64;
 
             maker_fees.push(MakerFeeInfo {
@@ -2190,7 +2190,7 @@ impl Taker {
                 estimated_fee_sats: fee_sats,
             });
 
-            amount_sats = (amount_sats - fee).max(0.0);
+            amount_sats = amount_sats.saturating_sub(fee_sats);
         }
 
         let total_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
