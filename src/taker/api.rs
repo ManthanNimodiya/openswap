@@ -1120,8 +1120,9 @@ impl Taker {
             .iter()
             .map(|mc| (mc.address.to_string(), mc.protocol, mc.offer.clone()))
             .collect();
+        let per_hop_mining_fee = estimate_funding_tx_fee_sats() * swap.params.tx_count as u64;
         let (maker_fees, _total_service_fee) =
-            Self::compute_route_maker_fees(send_amount, &maker_hops)?;
+            Self::compute_route_maker_fees(send_amount, &maker_hops, per_hop_mining_fee)?;
         let service_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
 
         // The headline number is a ceiling, so every cost is priced at its
@@ -2157,6 +2158,7 @@ impl Taker {
     pub(crate) fn compute_route_maker_fees(
         send_amount: Amount,
         makers: &[(String, ProtocolVersion, Option<Offer>)],
+        per_hop_mining_fee: u64,
     ) -> Result<(Vec<MakerFeeInfo>, u64), TakerError> {
         let maker_count = makers.len();
         let mut maker_fees = Vec::with_capacity(maker_count);
@@ -2190,7 +2192,7 @@ impl Taker {
                 estimated_fee_sats: fee_sats,
             });
 
-            amount_sats = amount_sats.saturating_sub(fee_sats);
+            amount_sats = amount_sats.saturating_sub(fee_sats + per_hop_mining_fee);
         }
 
         let total_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
