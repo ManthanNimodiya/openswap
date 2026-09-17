@@ -234,7 +234,7 @@ impl MakerServerConfig {
         );
         let technical_floor = crate::utill::per_output_floor(
             crate::protocol::ProtocolVersion::Taproot,
-            crate::utill::MIN_RELAY_FEE_RATE,
+            crate::utill::MIN_FEE_RATE,
         );
         if min_swap_amount < technical_floor {
             log::error!(
@@ -2171,7 +2171,7 @@ mod tests {
         let dir = bitcoind::tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
 
-        // An economic floor of 1,000 sats is above technical dust floor and must be accepted
+        // An economic floor of 1,000 sats is above technical dust/fee floor (554 sats) and must be accepted
         std::fs::write(
             &path,
             format!("fidelity_timelock = {timelock}\nmin_swap_amount = 1000\n"),
@@ -2180,10 +2180,10 @@ mod tests {
         let config = MakerServerConfig::new(Some(&path)).unwrap();
         assert_eq!(config.min_swap_amount, 1000);
 
-        // A sub-dust amount (e.g. 50 sats) must be rejected
+        // An amount below the admission MIN_FEE_RATE floor (e.g. 500 sats < 554 sats) must be rejected
         std::fs::write(
             &path,
-            format!("fidelity_timelock = {timelock}\nmin_swap_amount = 50\n"),
+            format!("fidelity_timelock = {timelock}\nmin_swap_amount = 500\n"),
         )
         .unwrap();
         assert!(MakerServerConfig::new(Some(&path)).is_err());

@@ -1032,6 +1032,11 @@ impl Taker {
         }
 
         let total_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
+        if total_fee_sats >= send_amount.to_sat() {
+            return Err(TakerError::General(
+                "Cumulative maker fees consume the send amount".into(),
+            ));
+        }
         let estimated_receive = send_amount
             .checked_sub(Amount::from_sat(total_fee_sats))
             .unwrap_or(Amount::ZERO);
