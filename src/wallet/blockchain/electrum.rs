@@ -831,7 +831,17 @@ impl Blockchain for Electrum {
         txid: &Txid,
         _block_hash: Option<&BlockHash>,
     ) -> Result<Transaction, WalletError> {
-        self.call(|c| c.transaction_get(txid))
+        let tx = self.call(|c| c.transaction_get(txid))?;
+        if tx.compute_txid() != *txid {
+            return Err(WalletError::Electrum(electrum_client::Error::Protocol(
+                serde_json::Value::String(format!(
+                    "Server returned transaction {} for requested {}",
+                    tx.compute_txid(),
+                    txid
+                )),
+            )));
+        }
+        Ok(tx)
     }
 
     fn get_raw_transaction_info(
@@ -844,6 +854,15 @@ impl Blockchain for Electrum {
         // serves and derive the rest from its mined height.
         // Only the few fields the wallet actually reads are populated.
         let tx = self.call(|c| c.transaction_get(txid))?;
+        if tx.compute_txid() != *txid {
+            return Err(WalletError::Electrum(electrum_client::Error::Protocol(
+                serde_json::Value::String(format!(
+                    "Server returned transaction {} for requested {}",
+                    tx.compute_txid(),
+                    txid
+                )),
+            )));
+        }
         let hex = serialize(&tx).to_lower_hex_string();
         let height = self.mined_height(&tx)?;
         let confirmations = self.confirmations_at(height)?;

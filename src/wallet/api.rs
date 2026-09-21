@@ -965,10 +965,16 @@ impl Wallet {
                         for input in &funding_tx.input {
                             let outpoint = input.previous_output;
                             if let Ok(parent_tx) = chain.get_raw_transaction(&outpoint.txid, None) {
-                                if let Some(output) = parent_tx.output.get(outpoint.vout as usize) {
-                                    if chain.is_confirmed_spend(&outpoint, &output.script_pubkey)? {
-                                        any_input_confirmed_spent = true;
-                                        break;
+                                if parent_tx.compute_txid() == outpoint.txid {
+                                    if let Some(output) =
+                                        parent_tx.output.get(outpoint.vout as usize)
+                                    {
+                                        if chain
+                                            .is_confirmed_spend(&outpoint, &output.script_pubkey)?
+                                        {
+                                            any_input_confirmed_spent = true;
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -985,13 +991,18 @@ impl Wallet {
                 } else if let Some(input) = swapcoin.contract_tx.input.first() {
                     let input_outpoint = input.previous_output;
                     if let Ok(parent_tx) = chain.get_raw_transaction(&input_outpoint.txid, None) {
-                        if let Some(output) = parent_tx.output.get(input_outpoint.vout as usize) {
-                            if chain.is_confirmed_spend(&input_outpoint, &output.script_pubkey)? {
-                                log::info!(
-                                    "Contract tx for {} cannot be signed and input outpoint was confirmed spent — discarding swapcoin",
-                                    swap_id,
-                                );
-                                return Ok(ContractChainState::Discarded);
+                        if parent_tx.compute_txid() == input_outpoint.txid {
+                            if let Some(output) = parent_tx.output.get(input_outpoint.vout as usize)
+                            {
+                                if chain
+                                    .is_confirmed_spend(&input_outpoint, &output.script_pubkey)?
+                                {
+                                    log::info!(
+                                        "Contract tx for {} cannot be signed and input outpoint was confirmed spent — discarding swapcoin",
+                                        swap_id,
+                                    );
+                                    return Ok(ContractChainState::Discarded);
+                                }
                             }
                         }
                     }
@@ -5210,5 +5221,59 @@ mod legacy_recovery_tests {
                 Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-parent", &sc).unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_mismatched_parent_tx_is_not_yet() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let mismatched_txid = Txid::from_byte_array([99u8; 32]);
+
+        let spending_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_tx.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let funding_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(mismatched_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
+        for_both_backends(
+            vec![(parent_tx, Some(10), false), (spending_tx, Some(11), true)],
+            |blockchain| {
+                let res =
+                    Wallet::ensure_contract_on_chain(&blockchain, "swap-mismatched", &sc).unwrap();
+                assert_eq!(res, ContractChainState::NotYet);
+            },
+        );
     }
 }
