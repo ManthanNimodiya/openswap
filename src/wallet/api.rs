@@ -4489,7 +4489,10 @@ mod legacy_recovery_tests {
         net::TcpListener,
     };
 
-    fn start_electrum_recovery_stub(known_txs: Vec<(Transaction, Option<u64>, bool)>) -> String {
+    fn start_electrum_recovery_stub(
+        known_txs: Vec<(Transaction, Option<u64>, bool)>,
+        aliases: Vec<(Txid, Transaction)>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
         let url = format!("tcp://{}", listener.local_addr().unwrap());
         let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
@@ -4502,6 +4505,7 @@ mod legacy_recovery_tests {
                 let _ = stream.set_nodelay(true);
                 let (hash, header) = (genesis_hash.clone(), header_hex.clone());
                 let txs = known_txs.clone();
+                let aliases = aliases.clone();
                 std::thread::spawn(move || {
                     let mut out = stream.try_clone().expect("clone stub stream");
                     for line in BufReader::new(stream).lines() {
@@ -4573,6 +4577,16 @@ mod legacy_recovery_tests {
                                         "id": id,
                                         "result": serialize_hex(tx)
                                     })
+                                } else if let Some((_, tx)) =
+                                    aliases.iter().find(|(alias_txid, _)| {
+                                        alias_txid.to_string() == txid_requested
+                                    })
+                                {
+                                    json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": serialize_hex(tx)
+                                    })
                                 } else {
                                     json!({
                                         "jsonrpc": "2.0",
@@ -4599,7 +4613,10 @@ mod legacy_recovery_tests {
         url
     }
 
-    fn start_core_recovery_stub(known_txs: Vec<(Transaction, Option<u64>, bool)>) -> String {
+    fn start_core_recovery_stub(
+        known_txs: Vec<(Transaction, Option<u64>, bool)>,
+        aliases: Vec<(Txid, Transaction)>,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind core stub");
         let addr = listener.local_addr().unwrap();
         let url = format!("{}:{}", addr.ip(), addr.port());
@@ -4609,6 +4626,7 @@ mod legacy_recovery_tests {
                 let Ok(mut stream) = incoming else { continue };
                 let _ = stream.set_nodelay(true);
                 let txs = known_txs.clone();
+                let aliases = aliases.clone();
                 std::thread::spawn(move || {
                     let mut reader = BufReader::new(stream.try_clone().expect("clone core stream"));
                     loop {
@@ -4706,6 +4724,65 @@ mod legacy_recovery_tests {
                                             "vout": vout,
                                             "blockhash": blockhash,
                                             "confirmations": if height.is_some() { 1 } else { 0 },
+                                            "time": 100,
+                                            "blocktime": 100,
+                                        });
+                                        (
+                                            200,
+                                            json!({"jsonrpc": "1.0", "id": id, "result": result, "error": Value::Null}),
+                                        )
+                                    } else {
+                                        (
+                                            200,
+                                            json!({"jsonrpc": "1.0", "id": id, "result": serialize_hex(tx), "error": Value::Null}),
+                                        )
+                                    }
+                                } else if let Some((_, tx)) = aliases
+                                    .iter()
+                                    .find(|(alias_txid, _)| alias_txid.to_string() == txid_req)
+                                {
+                                    if verbose {
+                                        let vin: Vec<Value> = tx
+                                            .input
+                                            .iter()
+                                            .map(|i| {
+                                                json!({
+                                                    "txid": i.previous_output.txid.to_string(),
+                                                    "vout": i.previous_output.vout,
+                                                    "scriptSig": {"asm": "", "hex": serialize_hex(&i.script_sig)},
+                                                    "sequence": i.sequence.0,
+                                                })
+                                            })
+                                            .collect();
+                                        let vout: Vec<Value> = tx
+                                            .output
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(n, o)| {
+                                                json!({
+                                                    "value": o.value.to_btc(),
+                                                    "n": n,
+                                                    "scriptPubKey": {
+                                                        "asm": "",
+                                                        "hex": serialize_hex(&o.script_pubkey),
+                                                        "type": null,
+                                                    }
+                                                })
+                                            })
+                                            .collect();
+                                        let result = json!({
+                                            "in_active_chain": null,
+                                            "hex": serialize_hex(tx),
+                                            "txid": txid_req,
+                                            "hash": tx.compute_wtxid().to_string(),
+                                            "size": tx.total_size(),
+                                            "vsize": tx.vsize(),
+                                            "version": tx.version.0 as u32,
+                                            "locktime": tx.lock_time.to_consensus_u32(),
+                                            "vin": vin,
+                                            "vout": vout,
+                                            "blockhash": Value::Null,
+                                            "confirmations": 0,
                                             "time": 100,
                                             "blocktime": 100,
                                         });
@@ -4899,11 +4976,12 @@ mod legacy_recovery_tests {
         url
     }
 
-    fn for_both_backends<F: Fn(AnyBlockchain)>(
+    fn for_both_backends_with_aliases<F: Fn(AnyBlockchain)>(
         known_txs: Vec<(Transaction, Option<u64>, bool)>,
+        aliases: Vec<(Txid, Transaction)>,
         test_fn: F,
     ) {
-        let electrum_url = start_electrum_recovery_stub(known_txs.clone());
+        let electrum_url = start_electrum_recovery_stub(known_txs.clone(), aliases.clone());
         let electrum = Electrum::new(&crate::wallet::ElectrumConfig {
             url: electrum_url,
             ..Default::default()
@@ -4911,13 +4989,20 @@ mod legacy_recovery_tests {
         .expect("connect to electrum stub");
         test_fn(AnyBlockchain::Electrum(electrum));
 
-        let core_url = start_core_recovery_stub(known_txs);
+        let core_url = start_core_recovery_stub(known_txs, aliases);
         let core = CoreRPC::new(&CoreRpcConfig {
             url: core_url,
             ..Default::default()
         })
         .expect("connect to core stub");
         test_fn(AnyBlockchain::CoreRPC(core));
+    }
+
+    fn for_both_backends<F: Fn(AnyBlockchain)>(
+        known_txs: Vec<(Transaction, Option<u64>, bool)>,
+        test_fn: F,
+    ) {
+        for_both_backends_with_aliases(known_txs, vec![], test_fn);
     }
 
     fn make_legacy_outgoing_swapcoin(funding_tx: Option<Transaction>) -> OutgoingSwapCoin {
@@ -4952,6 +5037,7 @@ mod legacy_recovery_tests {
             ScriptBuf::new(),
             timelock_privkey,
             Amount::from_sat(50_000),
+            1,
         );
         sc.funding_tx = funding_tx;
         sc.others_contract_sig = None;
@@ -5005,7 +5091,9 @@ mod legacy_recovery_tests {
         for_both_backends(
             vec![(parent_tx, Some(10), false), (spending_tx, Some(11), true)],
             |blockchain| {
-                let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-spent", &sc).unwrap();
+                let res =
+                    Wallet::ensure_contract_on_chain(&blockchain, "swap-spent", &sc, &|_| false)
+                        .unwrap();
                 assert_eq!(res, ContractChainState::Discarded);
             },
         );
@@ -5070,6 +5158,7 @@ mod legacy_recovery_tests {
             ScriptBuf::new(),
             timelock_privkey,
             Amount::from_sat(50_000),
+            1,
         );
         sc.funding_tx = None;
         sc.others_contract_sig = None;
@@ -5077,9 +5166,13 @@ mod legacy_recovery_tests {
         for_both_backends(
             vec![(parent_tx, Some(10), false), (spending_tx, Some(11), true)],
             |blockchain| {
-                let res =
-                    Wallet::ensure_contract_on_chain(&blockchain, "swap-no-funding-spent", &sc)
-                        .unwrap();
+                let res = Wallet::ensure_contract_on_chain(
+                    &blockchain,
+                    "swap-no-funding-spent",
+                    &sc,
+                    &|_| false,
+                )
+                .unwrap();
                 assert_eq!(res, ContractChainState::Discarded);
             },
         );
@@ -5115,7 +5208,9 @@ mod legacy_recovery_tests {
 
         let sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
         for_both_backends(vec![(parent_tx, Some(10), true)], |blockchain| {
-            let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent", &sc).unwrap();
+            let res =
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent", &sc, &|_| false)
+                    .unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
@@ -5124,7 +5219,9 @@ mod legacy_recovery_tests {
     fn test_ensure_contract_unsigned_legacy_with_no_funding_tx_and_no_onchain_input_is_not_yet() {
         let sc = make_legacy_outgoing_swapcoin(None);
         for_both_backends(vec![], |blockchain| {
-            let res = Wallet::ensure_contract_on_chain(&blockchain, "swap-no-input", &sc).unwrap();
+            let res =
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-no-input", &sc, &|_| false)
+                    .unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
@@ -5161,9 +5258,13 @@ mod legacy_recovery_tests {
         for_both_backends(
             vec![(parent_tx, Some(10), true), (funding_tx, None, true)],
             |blockchain| {
-                let res =
-                    Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-funding", &sc)
-                        .unwrap();
+                let res = Wallet::ensure_contract_on_chain(
+                    &blockchain,
+                    "swap-mempool-funding",
+                    &sc,
+                    &|_| false,
+                )
+                .unwrap();
                 assert_eq!(res, ContractChainState::NotYet);
             },
         );
@@ -5212,13 +5313,17 @@ mod legacy_recovery_tests {
             ScriptBuf::new(),
             timelock_privkey,
             Amount::from_sat(50_000),
+            1,
         );
         sc.funding_tx = None;
         sc.others_contract_sig = None;
 
         for_both_backends(vec![(parent_tx, None, true)], |blockchain| {
             let res =
-                Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-parent", &sc).unwrap();
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-mempool-parent", &sc, &|_| {
+                    false
+                })
+                .unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
@@ -5267,11 +5372,102 @@ mod legacy_recovery_tests {
         };
 
         let sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
-        for_both_backends(
-            vec![(parent_tx, Some(10), false), (spending_tx, Some(11), true)],
+        for_both_backends_with_aliases(
+            vec![
+                (parent_tx.clone(), Some(10), false),
+                (spending_tx, Some(11), true),
+            ],
+            vec![(mismatched_txid, parent_tx)],
             |blockchain| {
                 let res =
-                    Wallet::ensure_contract_on_chain(&blockchain, "swap-mismatched", &sc).unwrap();
+                    Wallet::ensure_contract_on_chain(&blockchain, "swap-mismatched", &sc, &|_| {
+                        false
+                    })
+                    .unwrap();
+                assert_eq!(res, ContractChainState::NotYet);
+            },
+        );
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_no_funding_tx_and_mismatched_parent_tx_is_not_yet()
+    {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let mismatched_txid = Txid::from_byte_array([99u8; 32]);
+
+        let spending_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_tx.compute_txid(), 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(90_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let dummy_contract_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(mismatched_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let my_privkey = SecretKey::from_slice(&[2u8; 32]).unwrap();
+        let other_privkey = SecretKey::from_slice(&[3u8; 32]).unwrap();
+        let other_pubkey = PublicKey {
+            compressed: true,
+            inner: bitcoin::secp256k1::PublicKey::from_secret_key(&secp, &other_privkey),
+        };
+        let timelock_privkey = SecretKey::from_slice(&[4u8; 32]).unwrap();
+
+        let mut sc = OutgoingSwapCoin::new_legacy(
+            my_privkey,
+            other_pubkey,
+            dummy_contract_tx,
+            ScriptBuf::new(),
+            timelock_privkey,
+            Amount::from_sat(50_000),
+            1,
+        );
+        sc.funding_tx = None;
+        sc.others_contract_sig = None;
+
+        for_both_backends_with_aliases(
+            vec![
+                (parent_tx.clone(), Some(10), false),
+                (spending_tx, Some(11), true),
+            ],
+            vec![(mismatched_txid, parent_tx)],
+            |blockchain| {
+                let res = Wallet::ensure_contract_on_chain(
+                    &blockchain,
+                    "swap-no-funding-mismatched",
+                    &sc,
+                    &|_| false,
+                )
+                .unwrap();
                 assert_eq!(res, ContractChainState::NotYet);
             },
         );

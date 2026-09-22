@@ -812,7 +812,7 @@ impl Blockchain for Electrum {
             if entry.tx_hash == outpoint.txid || entry.height <= 0 {
                 continue;
             }
-            let tx = self.call(|c| c.transaction_get(&entry.tx_hash))?;
+            let tx = self.get_raw_transaction(&entry.tx_hash, None)?;
             if tx.input.iter().any(|i| i.previous_output == *outpoint) {
                 return Ok(true);
             }
