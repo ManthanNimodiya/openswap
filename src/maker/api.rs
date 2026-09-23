@@ -1592,7 +1592,6 @@ impl MakerTrait for MakerServer {
             }
         }
 
->>>>>>> b35a8c2e (feat(maker): derive minimum swap amount from fees and dust floor)
         // Check timelock bounds and work out how long the funds stay locked.
         let locked_blocks = if details.protocol_version == ProtocolVersion::Legacy {
             if details.timelock < MIN_CONTRACT_REACTION_TIME as u32 {
@@ -2853,10 +2852,10 @@ mod tests {
         let config = MakerServerConfig::new(Some(&path)).unwrap();
         assert_eq!(config.min_swap_amount, 1000);
 
-        // An amount below the admission MIN_FEE_RATE floor (e.g. 500 sats < 554 sats) must be rejected
+        // An amount below the admission MIN_FEE_RATE floor (e.g. 200 sats < technical floor) must be rejected
         std::fs::write(
             &path,
-            format!("fidelity_timelock = {timelock}\nmin_swap_amount = 500\n"),
+            format!("fidelity_timelock = {timelock}\nmin_swap_amount = 200\n"),
         )
         .unwrap();
         assert!(MakerServerConfig::new(Some(&path)).is_err());

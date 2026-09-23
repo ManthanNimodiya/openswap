@@ -4,7 +4,7 @@ use bitcoin::{
     hashes::Hash,
     key::{rand::thread_rng, Keypair},
     secp256k1::{All, Secp256k1, SecretKey},
-    Address, Amount, Network, PublicKey, ScriptBuf, WitnessProgram, WitnessVersion,
+    Address, Amount, FeeRate, Network, PublicKey, ScriptBuf, WitnessProgram, WitnessVersion,
 };
 use bitcoind::bitcoincore_rpc::json::ListUnspentResultEntry;
 #[cfg(not(feature = "integration-test"))]
@@ -109,6 +109,9 @@ pub const MIN_REQUIRED_CONFIRM: u32 = 1;
 /// Default fee rate in sats/vb for all transactions, and the absolute floor:
 /// Bitcoin Core's default `minrelaytxfee`. Lower rates stop relaying.
 pub const MIN_RELAY_FEE_RATE: f64 = 1.0;
+
+/// Alias for MIN_RELAY_FEE_RATE
+pub const MIN_FEE_RATE: f64 = MIN_RELAY_FEE_RATE;
 
 /// True when a caller-supplied fee rate cannot be used: not a real number, or
 /// under the floor Bitcoin nodes forward at. Callers word their own refusal.
@@ -263,8 +266,7 @@ pub fn per_output_floor(protocol: crate::protocol::ProtocolVersion, feerate: f64
 ///
 /// Used both by the maker (for routed amount) and by taker's `expected_amount_for_hop`
 pub fn estimate_funding_tx_fee_sats() -> u64 {
-    calculate_fee_sats((11 + 68 + 31 + 43) + (11 + 68 + 43))
-}
+    calculate_fee_sats_at_feerate((11 + 68 + 31 + 43) + (11 + 68 + 43), MIN_RELAY_FEE_RATE)
 }
 
 /// Sets up the logger for the taker component.

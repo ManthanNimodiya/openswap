@@ -622,7 +622,6 @@ mod tests {
 
         // Send amount of 2,000 sats: base fee 1000 + rel fee 200 + time fee 200 = 1400 < 2000 -> must pass
         assert!(Taker::validate_offer(&offer, 0, Amount::from_sat(2000)).is_ok());
->>>>>>> b35a8c2e (feat(maker): derive minimum swap amount from fees and dust floor)
     }
 
     #[test]

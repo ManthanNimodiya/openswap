@@ -1120,7 +1120,8 @@ impl Taker {
             .iter()
             .map(|mc| (mc.address.to_string(), mc.protocol, mc.offer.clone()))
             .collect();
-        let per_hop_mining_fee = estimate_funding_tx_fee_sats() * swap.params.tx_count as u64;
+        let per_hop_mining_fee =
+            crate::utill::estimate_funding_tx_fee_sats() * swap.params.tx_count as u64;
         let (maker_fees, _total_service_fee) =
             Self::compute_route_maker_fees(send_amount, &maker_hops, per_hop_mining_fee)?;
         let service_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
