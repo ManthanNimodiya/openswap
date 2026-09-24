@@ -64,11 +64,11 @@ const TEST_CASES: &[(f64, &[f64], &str, &str)] = &[
 #[test]
 fn test_address_grouping_behavior() {
     // Initialize test environment with one maker (no swap needed, just wallet testing)
-    let makers_config_map = vec![(8702, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, _takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     println!("=== Testing Smart Address Grouping Behavior ===");
 
@@ -187,11 +187,11 @@ fn test_address_grouping_behavior() {
 #[test]
 fn test_separated_utxo_coin_selection() {
     // Initialize test environment with TWO makers and one taker
-    let makers_config_map = vec![(8702, None), (18702, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     warn!("Running Test: Separated UTXO Coin Selection");
     let bitcoind = &test_framework.bitcoind;
@@ -391,11 +391,11 @@ fn test_separated_utxo_coin_selection() {
 
 #[test]
 fn test_manual_coinselection() {
-    let makers_config_map = vec![(28702, None), (38702, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = &mut takers[0];
@@ -736,20 +736,20 @@ fn test_manual_coinselection() {
 /// log line "3 receivers, 1 senders" pins the degradation.
 #[test]
 fn test_legacy_swap_completes_with_degraded_splits() {
-    run_degraded_split_swap(ProtocolVersion::Legacy, 8404, 21701);
+    run_degraded_split_swap(ProtocolVersion::Legacy);
 }
 
 /// Same fragmented pool on Taproot: admission and funding share the planner
 /// with Legacy, so the same degradation must show on the other protocol.
 #[test]
 fn test_taproot_swap_completes_with_degraded_splits() {
-    run_degraded_split_swap(ProtocolVersion::Taproot, 8405, 21702);
+    run_degraded_split_swap(ProtocolVersion::Taproot);
 }
 
-fn run_degraded_split_swap(protocol: ProtocolVersion, port: u16, rpc: u16) {
+fn run_degraded_split_swap(protocol: ProtocolVersion) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
+            1,
             vec![TakerBehavior::Normal],
             vec![openswap::maker::MakerBehavior::Normal],
         );

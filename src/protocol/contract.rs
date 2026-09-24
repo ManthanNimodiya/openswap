@@ -1515,4 +1515,32 @@ mod test {
                 .is_ok()
         );
     }
+
+    #[test]
+    fn test_create_senders_contract_tx_exact_fee_deduction() {
+        let secp = Secp256k1::new();
+        let pubkey = |byte: u8| {
+            PrivateKey::from_slice(&[byte; 32], bitcoin::NetworkKind::Test)
+                .unwrap()
+                .public_key(&secp)
+        };
+        let redeemscript = create_contract_redeemscript(
+            &pubkey(1),
+            &pubkey(2),
+            &Hash160::from_slice(&[0u8; 20]).unwrap(),
+            &50,
+        );
+        let dummy_op = OutPoint::null();
+        let input_amount = Amount::from_sat(50_000);
+        let fee_rate = 1.0;
+        let tx =
+            create_senders_contract_tx(dummy_op, input_amount, &redeemscript, fee_rate).unwrap();
+
+        let fee_amount = fee_at_rate_sats(CONTRACT_TX_VSIZE, fee_rate).unwrap();
+        assert_eq!(tx.output.len(), 1);
+        assert_eq!(
+            tx.output[0].value,
+            input_amount - Amount::from_sat(fee_amount)
+        );
+    }
 }

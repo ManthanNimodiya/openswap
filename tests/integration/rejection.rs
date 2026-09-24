@@ -27,7 +27,8 @@ use openswap::{
     taker::{
         error::TakerError,
         swap_tracker::{ExchangeProgress, SwapTracker},
-        MakerState, SwapParams, Taker, TakerBehavior,
+        BanReason, BanRecord, MakerState, SwapParams, Taker, TakerBehavior, UnavailableReason,
+        UnavailableState,
     },
     utill::{MAX_TX_COUNT, MIN_RELAY_FEE_RATE, NO_SHUTDOWN, TX_BROADCAST_TIMEOUT},
     wallet::{AddressType, Destination},
@@ -37,6 +38,7 @@ use super::test_framework::*;
 
 use log::{info, warn};
 use std::{
+    fs,
     sync::{atomic::Ordering::Relaxed, Arc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -46,12 +48,12 @@ use std::{
 fn test_maker_rejects_out_of_bounds_swap_details() {
     warn!("Running Test: Maker Rejection of SwapDetails + CloseEarly");
 
-    let makers_config_map = vec![(9202, Some(21501)), (19202, Some(21502))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -339,12 +341,12 @@ fn test_low_swap_liquidity() {
     warn!("Running Test: Low Swap Liquidity check");
 
     // Create a maker with normal behaviour
-    let makers_config_map = vec![(8402, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     // Initialize test framework
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -452,12 +454,12 @@ fn drain_maker_liquidity_after_fidelity(maker: &Arc<MakerServer>, bitcoind: &bit
 
 #[test]
 fn makers_reject_duplicate_funding_outpoints() {
-    let makers_config_map = vec![(8802, Some(21301)), (18802, Some(21302))];
+    let maker_count = 2;
     let taker_behaviors = vec![TakerBehavior::DuplicateFundingOutpoint];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     for taker in &mut takers {
@@ -506,19 +508,9 @@ fn makers_reject_duplicate_funding_outpoints() {
 /// The maker guards a Legacy funding proof in order — entry count, declared
 /// sum, then duplication — so each malice keeps the earlier guards satisfied
 /// to reach its own. One maker is enough: the rejection is the point.
-fn run_legacy_proof_guard(
-    port: u16,
-    rpc: u16,
-    behavior: TakerBehavior,
-    tx_count: u32,
-    expected: &str,
-) {
+fn run_legacy_proof_guard(behavior: TakerBehavior, tx_count: u32, expected: &str) {
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
-            vec![behavior],
-            vec![MakerBehavior::Normal],
-        );
+        TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -553,8 +545,6 @@ fn run_legacy_proof_guard(
 #[test]
 fn maker_rejects_overcounted_proof_of_funding() {
     run_legacy_proof_guard(
-        8808,
-        21310,
         TakerBehavior::ExtraFundingTxEntry,
         3,
         "declared incoming count",
@@ -564,8 +554,6 @@ fn maker_rejects_overcounted_proof_of_funding() {
 #[test]
 fn maker_rejects_overstated_proof_of_funding() {
     run_legacy_proof_guard(
-        8810,
-        21311,
         TakerBehavior::OverstatedFundingAmount,
         3,
         "declared swap amount",
@@ -575,8 +563,6 @@ fn maker_rejects_overstated_proof_of_funding() {
 #[test]
 fn maker_rejects_duplicated_funding_outpoint() {
     run_legacy_proof_guard(
-        8812,
-        21312,
         TakerBehavior::DuplicateFundingOutpoint,
         2,
         "Duplicate funding outpoint",
@@ -589,8 +575,6 @@ fn maker_rejects_duplicated_funding_outpoint() {
 #[test]
 fn maker_rejects_underdelivered_legacy_amount() {
     run_legacy_proof_guard(
-        9704,
-        21701,
         TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
         3,
         "declared swap amount",
@@ -601,8 +585,6 @@ fn maker_rejects_underdelivered_legacy_amount() {
 #[test]
 fn maker_rejects_underdelivered_taproot_amount() {
     run_taproot_declaration_guard(
-        9706,
-        21702,
         TakerBehavior::ForgeBounds(Amount::from_sat(600_000)),
         "does not match negotiated swap amount",
     );
@@ -613,8 +595,6 @@ fn maker_rejects_underdelivered_taproot_amount() {
 #[test]
 fn maker_rejects_wrong_taproot_incoming_count() {
     run_taproot_declaration_guard(
-        9708,
-        21703,
         TakerBehavior::ForgeIncomingCount(2),
         "!= declared incoming count",
     );
@@ -622,13 +602,9 @@ fn maker_rejects_wrong_taproot_incoming_count() {
 
 /// The taker funds honestly; the hook forges only the SwapDetails
 /// declaration, so the maker's own equality check is what refuses.
-fn run_taproot_declaration_guard(port: u16, rpc: u16, behavior: TakerBehavior, expected: &str) {
+fn run_taproot_declaration_guard(behavior: TakerBehavior, expected: &str) {
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
-            vec![behavior],
-            vec![MakerBehavior::Normal],
-        );
+        TestFramework::init::<BitcoindBackend>(1, vec![behavior], vec![MakerBehavior::Normal]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -667,7 +643,7 @@ fn run_taproot_declaration_guard(port: u16, rpc: u16, behavior: TakerBehavior, e
 fn one_utxo_taker_completes_degraded_swap() {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9710, Some(21704))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -706,12 +682,12 @@ fn one_utxo_taker_completes_degraded_swap() {
 /// its own funding output through the contract path first, then still names that
 /// outpoint in ProofOfFunding. The maker must refuse before funding the next hop.
 fn run_rejects_spent_funding_outpoint<B: TestBackend>(behavior: TakerBehavior) {
-    let makers_config_map = vec![(8804, Some(21303)), (18804, Some(21304))];
+    let maker_count = 2;
     let taker_behaviors = vec![behavior];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<B>(maker_count, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     fund_taker_default(&takers[0], bitcoind, 3);
@@ -771,12 +747,12 @@ fn maker_rejects_spent_funding_outpoint_mempool() {
 /// once the re-armed broadcast window expires, not wait forever.
 #[test]
 fn maker_errors_when_seen_funding_tx_is_evicted() {
-    let makers_config_map = vec![(8806, Some(21305)), (18806, Some(21306))];
+    let maker_count = 2;
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -850,12 +826,12 @@ fn maker_errors_when_seen_funding_tx_is_evicted() {
 
 #[test]
 fn maker_rejects_proof_of_funding_with_missing_contract_cache() {
-    let makers_config_map = vec![(6102, None), (16102, None)];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::SkipSenderContractSigs];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -939,12 +915,12 @@ fn maker_rejects_proof_of_funding_with_missing_contract_cache() {
 #[test]
 fn test_taproot_maker_rejects_contract_amount_mismatch() {
     warn!("Running Test: Taproot maker rejects mismatched contract amount");
-    let makers_config_map = vec![(7202, Some(19161)), (17202, Some(19162))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::InvalidTaprootContractAmount];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -989,7 +965,7 @@ fn test_taproot_maker_rejects_contract_amount_mismatch() {
 
 #[test]
 fn test_legacy_taker_rejects_malformed_maker_funding_output() {
-    let makers_config_map = vec![(6102, Some(19051)), (16102, Some(19052))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     // First maker returns Legacy sender contract data whose contract input points
     // at a real funding tx output, but not the advertised 2-of-2 multisig output.
@@ -999,7 +975,7 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1057,10 +1033,10 @@ fn test_legacy_taker_rejects_malformed_maker_funding_output() {
 
 #[test]
 fn test_legacy_taker_rejects_fee_skimming_maker() {
-    let makers_config_map = vec![(6103, Some(19053))];
+    let maker_count = 1;
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            maker_count,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::FeeSkimming],
         );
@@ -1092,7 +1068,7 @@ fn test_legacy_taker_rejects_fee_skimming_maker() {
 #[test]
 fn test_taproot_rejects_underfunded_maker_contract() {
     // ---- Setup ----
-    let makers_config_map = vec![(7102, Some(19061))];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
 
     // The maker funds a 10k-sat Taproot output but advertises the normal
@@ -1101,7 +1077,7 @@ fn test_taproot_rejects_underfunded_maker_contract() {
     let maker_behaviors = vec![MakerBehavior::UnderfundTaprootContract];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1166,8 +1142,6 @@ fn test_taproot_rejects_underfunded_maker_contract() {
 #[test]
 fn test_taproot_rejects_fee_skimming_maker() {
     test_taproot_rejection(
-        7103,
-        19062,
         MakerBehavior::FeeSkimming,
         "does not match the negotiated hop total",
     );
@@ -1179,18 +1153,16 @@ fn test_taproot_rejects_fee_skimming_maker() {
 #[test]
 fn taker_rejects_inflated_taproot_contract_amount() {
     test_taproot_rejection(
-        7104,
-        19063,
         MakerBehavior::InflateContractAmount,
         "does not match output value",
     );
 }
 
-fn test_taproot_rejection(port: u16, rpc: u16, behavior: MakerBehavior, expected_error: &str) {
-    let makers_config_map = vec![(port, Some(rpc))];
+fn test_taproot_rejection(behavior: MakerBehavior, expected_error: &str) {
+    let maker_count = 1;
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            maker_count,
             vec![TakerBehavior::Normal],
             vec![behavior],
         );
@@ -1215,7 +1187,7 @@ fn test_taproot_rejection(port: u16, rpc: u16, behavior: MakerBehavior, expected
         error
     );
 
-    // The lie is arithmetically proven, so the maker's standing steps off Good.
+    // The lie is arithmetically proven, so the maker is banned outright.
     let standing = taker
         .fetch_offers()
         .unwrap()
@@ -1223,10 +1195,15 @@ fn test_taproot_rejection(port: u16, rpc: u16, behavior: MakerBehavior, expected
         .into_iter()
         .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
         .expect("the maker must be in the offerbook");
-    assert_eq!(
-        standing.state,
-        MakerState::Unresponsive { retries: 1 },
-        "a proven contract violation must step the maker Good -> Unresponsive"
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven contract violation must ban the maker"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -1238,11 +1215,11 @@ fn test_taproot_rejection(port: u16, rpc: u16, behavior: MakerBehavior, expected
 fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
     warn!("Running Test: InsufficientLiquidity from active reservation");
 
-    let makers_config_map = vec![(8602, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal, TakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, vec![]);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, vec![]);
 
     let bitcoind = &test_framework.bitcoind;
     let maker = &makers[0];
@@ -1313,7 +1290,7 @@ fn test_maker_rejects_insufficient_liquidity_from_active_reservation() {
 #[test]
 fn taker_rejects_out_of_bounds_params_at_prepare() {
     let (test_framework, mut takers, _makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(vec![], vec![TakerBehavior::Normal], vec![]);
+        TestFramework::init::<BitcoindBackend>(0, vec![TakerBehavior::Normal], vec![]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
     let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
@@ -1388,11 +1365,8 @@ fn maker_rejects_forged_swap_details_at_admission_electrum() {
 }
 
 fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
-    let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        vec![(9104, Some(21602))],
-        vec![TakerBehavior::Normal],
-        vec![MakerBehavior::Normal],
-    );
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<B>(1, vec![TakerBehavior::Normal], vec![MakerBehavior::Normal]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
     let taker_original_balance = fund_taker_default(taker, bitcoind, 3);
@@ -1482,18 +1456,12 @@ fn run_maker_rejects_forged_swap_details_at_admission<B: TestBackend>() {
 /// A maker whose contract response is corrupt — overcounted, or repeating one
 /// funded output — is cheating; the taker must refuse it.
 fn run_corrupt_contract_response(
-    port: u16,
-    rpc: u16,
     protocol: ProtocolVersion,
     behavior: MakerBehavior,
     expected: &str,
 ) {
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
-            vec![TakerBehavior::Normal],
-            vec![behavior],
-        );
+        TestFramework::init::<BitcoindBackend>(1, vec![TakerBehavior::Normal], vec![behavior]);
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
     fund_taker_default(taker, bitcoind, 3);
@@ -1525,10 +1493,15 @@ fn run_corrupt_contract_response(
         .into_iter()
         .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
         .expect("the maker must be in the offerbook");
-    assert_eq!(
-        standing.state,
-        MakerState::Unresponsive { retries: 1 },
-        "a proven contract violation must step the maker Good -> Unresponsive"
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven contract violation must ban the maker"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -1539,8 +1512,6 @@ fn run_corrupt_contract_response(
 #[test]
 fn taker_rejects_overproduced_legacy_contracts() {
     run_corrupt_contract_response(
-        9106,
-        21603,
         ProtocolVersion::Legacy,
         MakerBehavior::OverproduceContractData,
         "its reported plan has",
@@ -1550,8 +1521,6 @@ fn taker_rejects_overproduced_legacy_contracts() {
 #[test]
 fn taker_rejects_overproduced_taproot_contracts() {
     run_corrupt_contract_response(
-        9108,
-        21604,
         ProtocolVersion::Taproot,
         MakerBehavior::OverproduceContractData,
         "its reported plan has",
@@ -1563,8 +1532,6 @@ fn taker_rejects_overproduced_taproot_contracts() {
 #[test]
 fn taker_rejects_duplicated_taproot_contract_outpoint() {
     run_corrupt_contract_response(
-        9114,
-        21607,
         ProtocolVersion::Taproot,
         MakerBehavior::DuplicateContractOutpoint,
         "duplicate Taproot contract outpoint",
@@ -1576,8 +1543,6 @@ fn taker_rejects_duplicated_taproot_contract_outpoint() {
 #[test]
 fn taker_rejects_duplicated_legacy_contract_outpoint() {
     run_corrupt_contract_response(
-        9115,
-        21609,
         ProtocolVersion::Legacy,
         MakerBehavior::DuplicateContractOutpoint,
         "duplicate sender contract for funding outpoint",
@@ -1592,7 +1557,7 @@ fn taker_rejects_duplicated_legacy_contract_outpoint() {
 fn maker_without_fee_headroom_fails_before_any_broadcast() {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9110, Some(21605))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -1655,7 +1620,7 @@ fn maker_without_fee_headroom_fails_before_any_broadcast() {
 fn maker_rejects_over_budget_funding_plan() {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9116, Some(21608))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -1748,12 +1713,11 @@ fn run_maker_partial_broadcast<B: TestBackend>(protocol: ProtocolVersion, expect
         protocol
     );
 
-    let makers_config_map = vec![(9402, Some(21401))];
     let taker_behaviors = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::FailSecondBroadcast];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<B>(1, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1863,12 +1827,11 @@ fn maker_recovers_partial_broadcast_electrum() {
 fn run_taker_recovers_partial_broadcast_with_spare_maker<B: TestBackend>(expected_spendable: u64) {
     warn!("Running Test: taker partial funding broadcast, spare maker available");
 
-    let makers_config_map = vec![(9502, Some(21411)), (19502, Some(21412))];
     let taker_behaviors = vec![TakerBehavior::FailSecondFundingBroadcast];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behaviors, maker_behaviors);
+        TestFramework::init::<B>(2, taker_behaviors, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -1996,7 +1959,6 @@ fn taker_recovers_partial_broadcast_with_spare_maker_electrum() {
 /// rejected before the maker funds anything.
 struct ReplayScenario {
     name: &'static str,
-    ports: (u16, u16),
     behavior: TakerBehavior,
     protocol: ProtocolVersion,
     taker_utxos: u32,
@@ -2014,7 +1976,6 @@ struct ReplayScenario {
 
 const REPLAYED_TAPROOT_AFTER_COMPLETION: ReplayScenario = ReplayScenario {
     name: "maker rejects replayed Taproot contract data",
-    ports: (9602, 21421),
     behavior: TakerBehavior::ReplayTaprootContractData,
     protocol: ProtocolVersion::Taproot,
     taker_utxos: 3,
@@ -2035,7 +1996,6 @@ const REPLAYED_TAPROOT_AFTER_COMPLETION: ReplayScenario = ReplayScenario {
 
 const REPLAYED_LEGACY_POF_IN_FLIGHT: ReplayScenario = ReplayScenario {
     name: "maker rejects replayed Legacy contract data",
-    ports: (9612, 21422),
     behavior: TakerBehavior::ReplayLegacyProofOfFunding,
     protocol: ProtocolVersion::Legacy,
     taker_utxos: 4,
@@ -2056,7 +2016,6 @@ const REPLAYED_LEGACY_POF_IN_FLIGHT: ReplayScenario = ReplayScenario {
 
 const REPLAYED_TAPROOT_IN_FLIGHT: ReplayScenario = ReplayScenario {
     name: "maker rejects in-flight replayed Taproot contract data",
-    ports: (9614, 21423),
     behavior: TakerBehavior::ReplayTaprootContractDataInFlight,
     protocol: ProtocolVersion::Taproot,
     taker_utxos: 4,
@@ -2084,11 +2043,8 @@ const REPLAYED_TAPROOT_IN_FLIGHT: ReplayScenario = ReplayScenario {
 fn run_replay_guard<B: TestBackend>(s: ReplayScenario) {
     warn!("Running Test: {}", s.name);
 
-    let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        vec![(s.ports.0, Some(s.ports.1))],
-        vec![s.behavior],
-        vec![MakerBehavior::Normal],
-    );
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<B>(1, vec![s.behavior], vec![MakerBehavior::Normal]);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -2300,7 +2256,6 @@ fn wait_for_log_after(
 /// to one maker, mining paused so every swap stalls in the confirmation wait.
 #[allow(clippy::type_complexity)]
 fn concurrent_replay_setup(
-    ports: (u16, u16),
     behavior: TakerBehavior,
     taker_utxos: u32,
 ) -> (
@@ -2316,7 +2271,7 @@ fn concurrent_replay_setup(
 ) {
     let (test_framework, takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(ports.0, Some(ports.1))],
+            1,
             vec![behavior, behavior],
             vec![MakerBehavior::Normal],
         );
@@ -2370,7 +2325,7 @@ fn maker_rejects_concurrent_replayed_taproot_contract_data() {
         maker_address,
         log_path,
         log_offset,
-    ) = concurrent_replay_setup((9620, 21426), TakerBehavior::ReplayTaprootContractData, 3);
+    ) = concurrent_replay_setup(TakerBehavior::ReplayTaprootContractData, 3);
 
     let params = |address: &str| {
         SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500_000), 1)
@@ -2475,7 +2430,7 @@ fn maker_rejects_concurrent_replayed_legacy_proof_of_funding() {
         maker_address,
         log_path,
         log_offset,
-    ) = concurrent_replay_setup((9622, 21427), TakerBehavior::ReplayLegacyProofOfFunding, 4);
+    ) = concurrent_replay_setup(TakerBehavior::ReplayLegacyProofOfFunding, 4);
 
     let params = |address: &str| {
         SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500_000), 1)
@@ -2557,7 +2512,7 @@ fn maker_reprocesses_own_contracts_after_partial_broadcast() {
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9616, Some(21424))],
+            1,
             vec![TakerBehavior::ResumeAfterMakerDrop],
             vec![MakerBehavior::FailSecondBroadcast],
         );
@@ -2636,7 +2591,7 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
     // swap, so the test can resend the same SwapDetails afterwards.
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9618, Some(21425))],
+            1,
             vec![TakerBehavior::CrashBeforeRecovery],
             vec![MakerBehavior::SkipFundingBroadcast],
         );
@@ -2724,34 +2679,29 @@ fn maker_refuses_unfinished_swap_id_after_restart() {
 /// steps the maker Good -> Unresponsive in the offerbook.
 #[test]
 fn test_taproot_rejects_funding_fee_underpayment() {
-    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Taproot, 9702, 21431);
+    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Taproot);
 }
 
 #[test]
 fn test_legacy_rejects_funding_fee_underpayment() {
-    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Legacy, 9703, 21432);
+    run_rejects_funding_fee_underpayment::<BitcoindBackend>(ProtocolVersion::Legacy);
 }
 
 /// Same underpayment on Electrum: the real-fee check reads the funding
 /// inputs' prev txs from the indexer.
 #[test]
 fn test_taproot_rejects_funding_fee_underpayment_electrum() {
-    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Taproot, 9702, 21431);
+    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Taproot);
 }
 
 #[test]
 fn test_legacy_rejects_funding_fee_underpayment_electrum() {
-    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Legacy, 9703, 21432);
+    run_rejects_funding_fee_underpayment::<ElectrumBackend>(ProtocolVersion::Legacy);
 }
 
-fn run_rejects_funding_fee_underpayment<B: TestBackend>(
-    protocol: ProtocolVersion,
-    port: u16,
-    rpc: u16,
-) {
-    let makers_config_map = vec![(port, Some(rpc))];
+fn run_rejects_funding_fee_underpayment<B: TestBackend>(protocol: ProtocolVersion) {
     let (test_framework, mut takers, makers, block_generation_handle) = TestFramework::init::<B>(
-        makers_config_map,
+        1,
         vec![TakerBehavior::Normal],
         vec![MakerBehavior::UnderpayFundingFee],
     );
@@ -2789,10 +2739,15 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
         .into_iter()
         .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
         .expect("the maker must be in the offerbook");
-    assert_eq!(
-        standing.state,
-        MakerState::Unresponsive { retries: 1 },
-        "a proven fee shortfall must step the maker Good -> Unresponsive"
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven fee shortfall must ban the maker"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -2805,18 +2760,18 @@ fn run_rejects_funding_fee_underpayment<B: TestBackend>(
 /// violation, on both protocols.
 #[test]
 fn test_taproot_rejects_underreported_funding_inputs() {
-    run_rejects_underreported_funding_inputs(ProtocolVersion::Taproot, 9704, 21433);
+    run_rejects_underreported_funding_inputs(ProtocolVersion::Taproot);
 }
 
 #[test]
 fn test_legacy_rejects_underreported_funding_inputs() {
-    run_rejects_underreported_funding_inputs(ProtocolVersion::Legacy, 9705, 21434);
+    run_rejects_underreported_funding_inputs(ProtocolVersion::Legacy);
 }
 
-fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion, port: u16, rpc: u16) {
+fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion) {
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(rpc))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::UnderreportFundingInputs],
         );
@@ -2851,10 +2806,15 @@ fn run_rejects_underreported_funding_inputs(protocol: ProtocolVersion, port: u16
         .into_iter()
         .find(|m| m.address.to_string() == format!("127.0.0.1:{}", makers[0].config.network_port))
         .expect("the maker must be in the offerbook");
-    assert_eq!(
-        standing.state,
-        MakerState::Unresponsive { retries: 1 },
-        "a proven shape mismatch must step the maker Good -> Unresponsive"
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a proven shape mismatch must ban the maker"
     );
 
     shutdown_makers(&makers, maker_threads);
@@ -2891,7 +2851,6 @@ impl Drop for LifetimeOverride {
 /// end of the test or the two-hour default comes back.
 #[allow(clippy::type_complexity)]
 fn keepalive_admission(
-    port: u16,
     taker_behavior: TakerBehavior,
     lifetime_secs: Option<&str>,
     pause_mining: bool,
@@ -2908,7 +2867,7 @@ fn keepalive_admission(
     let lifetime = lifetime_secs.map(LifetimeOverride::set);
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(port, Some(port + 11630))],
+            1,
             vec![taker_behavior],
             vec![MakerBehavior::Normal],
         );
@@ -2965,7 +2924,7 @@ fn unfunded_swap_dies_at_lifetime_despite_keepalives() {
         swap_id,
         log_path,
         _lifetime,
-    ) = keepalive_admission(9811, TakerBehavior::Normal, Some("120"), false);
+    ) = keepalive_admission(TakerBehavior::Normal, Some("120"), false);
 
     let taker = takers.get_mut(0).unwrap();
     let maker = &makers[0];
@@ -3063,7 +3022,7 @@ fn keepalive_with_mempool_funding_still_refreshes() {
         swap_id,
         log_path,
         _lifetime,
-    ) = keepalive_admission(9812, TakerBehavior::SkipFundingConfirmWait, None, true);
+    ) = keepalive_admission(TakerBehavior::SkipFundingConfirmWait, None, true);
 
     let mut taker = takers.remove(0);
     let swap_thread = thread::spawn(move || taker.start_swap(&swap_id));
@@ -3119,12 +3078,7 @@ fn keepalive_naming_unseen_funding_is_refused() {
         swap_id,
         log_path,
         _lifetime,
-    ) = keepalive_admission(
-        9813,
-        TakerBehavior::WithholdFundingBroadcast,
-        Some("120"),
-        true,
-    );
+    ) = keepalive_admission(TakerBehavior::WithholdFundingBroadcast, Some("120"), true);
 
     let mut taker = takers.remove(0);
     let swap_thread = thread::spawn(move || taker.start_swap(&swap_id));
@@ -3189,7 +3143,7 @@ fn swap_cap_rejects_before_planning() {
 
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            vec![(9814, Some(21444))],
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -3271,4 +3225,439 @@ fn swap_cap_rejects_before_planning() {
 
     shutdown_makers(&makers, maker_threads);
     test_framework.finish(takers, block_generation_handle);
+}
+
+/// An offer whose minimum exceeds its maximum cannot price any amount. That is
+/// also what a maker low on liquidity publishes, so it must sideline the maker
+/// without banning it.
+#[test]
+fn an_unpriceable_offer_sidelines_without_banning() {
+    warn!("Running Test: Unpriceable Offer Sidelines Without Banning");
+
+    let makers_config_map = vec![(22502, Some(22115)), (22602, Some(22116))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![MakerBehavior::SendMalformedOffer, MakerBehavior::Normal];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || start_server(maker_clone).unwrap())
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    // One hop, so the honest maker alone can carry the route while the
+    // malformed offer is judged during the same offerbook sync.
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 1)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    let _ = taker.prepare_swap(swap_params);
+
+    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standing_of = |port: u16| {
+        standings
+            .iter()
+            .find(|m| m.address.to_string() == format!("127.0.0.1:{}", port))
+            .unwrap_or_else(|| panic!("maker on {} must be in the offerbook", port))
+            .state
+            .clone()
+    };
+
+    let publisher = standing_of(makers[0].config.network_port);
+    assert!(
+        matches!(
+            publisher,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::UnpriceableOffer,
+                ..
+            })
+        ),
+        "an unpriceable offer must sideline its publisher, not ban it, got {:?}",
+        publisher
+    );
+
+    let honest = standing_of(makers[1].config.network_port);
+    assert!(
+        !matches!(honest, MakerState::Banned(_)),
+        "the honest maker must not be blamed, got {:?}",
+        honest
+    );
+
+    info!("Unpriceable offer test completed successfully!");
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// Signatures made with a key nobody agreed to are well formed and still
+/// wrong. Only the maker that produced them is banned.
+#[test]
+fn wrong_key_sender_signatures_ban_their_signer() {
+    warn!("Running Test: Wrong-Key Sender Signatures Ban Their Signer");
+
+    let makers_config_map = vec![(22702, Some(22117)), (22802, Some(22118))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![
+        MakerBehavior::SignSenderContractsWithWrongKey,
+        MakerBehavior::Normal,
+    ];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || start_server(maker_clone).unwrap())
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    // Both makers are on the route, so there is no spare to substitute and the
+    // failure lands on the signer wherever it sits in the order.
+    let swap_params = SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 2)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("prepare must succeed");
+    let swap_result = taker.start_swap(&summary.swap_id);
+    assert!(
+        swap_result.is_err(),
+        "a swap signed with the wrong key must fail"
+    );
+
+    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standing_of = |port: u16| {
+        standings
+            .iter()
+            .find(|m| m.address.to_string() == format!("127.0.0.1:{}", port))
+            .unwrap_or_else(|| panic!("maker on {} must be in the offerbook", port))
+            .state
+            .clone()
+    };
+
+    let signer = standing_of(makers[0].config.network_port);
+    assert!(
+        matches!(
+            signer,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "the wrong-key signer must be banned, got {:?}",
+        signer
+    );
+
+    let honest = standing_of(makers[1].config.network_port);
+    assert!(
+        !matches!(honest, MakerState::Banned(_)),
+        "the honest maker must not be blamed, got {:?}",
+        honest
+    );
+
+    // Naming the banned maker by address must not get it back into a route:
+    // the only candidate is refused, so no route can be built at all.
+    let banned_address = format!("127.0.0.1:{}", makers[0].config.network_port);
+    let refusal = taker
+        .prepare_swap(
+            SwapParams::new(ProtocolVersion::Legacy, Amount::from_sat(500000), 1)
+                .with_tx_count(2)
+                .with_required_confirms(1)
+                .with_preferred_makers(vec![banned_address.clone()]),
+        )
+        .expect_err("a banned maker must not be usable by address");
+    assert!(
+        format!("{refusal:?}").contains("preferred makers"),
+        "unexpected refusal for a banned preferred maker: {:?}",
+        refusal
+    );
+
+    // A ban must outlive its bond. Expire both bonds so each maker redeems its
+    // old one and posts a new one for the same address.
+    let latest_bond = |maker: &MakerServer| {
+        let wallet = maker.wallet.read().unwrap();
+        wallet.get_fidelity_bonds().last().unwrap().clone()
+    };
+    let old_bonds: Vec<_> = makers.iter().map(|m| latest_bond(m)).collect();
+    let expiry = old_bonds
+        .iter()
+        .map(|bond| bond.lock_time.to_consensus_u32())
+        .max()
+        .unwrap();
+    let height = bitcoind.client.get_block_count().unwrap() as u32;
+    let mut remaining = expiry.saturating_sub(height) + 10;
+    while remaining > 0 {
+        let batch = remaining.min(100);
+        generate_blocks(bitcoind, batch as u64);
+        remaining -= batch;
+    }
+
+    let renewal_start = Instant::now();
+    while makers
+        .iter()
+        .zip(&old_bonds)
+        .any(|(maker, old)| latest_bond(maker).outpoint() == old.outpoint())
+    {
+        assert!(
+            renewal_start.elapsed() < Duration::from_secs(180),
+            "both makers must renew their expired bonds"
+        );
+        thread::sleep(Duration::from_secs(5));
+    }
+
+    // Only the taker runs discovery, so this line is its registry taking the
+    // banned maker's new bond.
+    let rebond_txid = latest_bond(&makers[0]).outpoint().txid.to_string();
+    let log_path = test_framework.temp_dir.join("taker/debug.log");
+    let discovery_start = Instant::now();
+    while !fs::read_to_string(&log_path).unwrap().lines().any(|line| {
+        line.contains("Stored validated fidelity candidate") && line.contains(&rebond_txid)
+    }) {
+        assert!(
+            discovery_start.elapsed() < Duration::from_secs(180),
+            "the taker must discover the banned maker's new bond"
+        );
+        thread::sleep(Duration::from_secs(5));
+    }
+
+    // The sync now meets the expired bond and the new one for the same
+    // address. Neither may lift the ban.
+    taker.sync_offerbook_and_wait().unwrap();
+    let rebonded = taker
+        .fetch_offers()
+        .unwrap()
+        .all_makers()
+        .into_iter()
+        .find(|m| m.address.to_string() == banned_address)
+        .expect("the banned maker must still be in the offerbook");
+    assert!(
+        matches!(
+            rebonded.state,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "a new bond must not lift the ban, got {:?}",
+        rebonded.state
+    );
+    assert_eq!(
+        rebonded.fidelity_outpoint,
+        Some(old_bonds[0].outpoint()),
+        "the banned record must keep its old bond"
+    );
+
+    info!("Wrong-key signature test completed successfully!");
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// A hashlock built for a key nobody agreed to would pay the next hop to the
+/// wrong key. Only the maker that built it is banned.
+#[test]
+fn wrong_hashlock_key_bans_its_builder() {
+    warn!("Running Test: Wrong Hashlock Key Bans Its Builder");
+
+    let makers_config_map = vec![(23102, Some(22121)), (23202, Some(22122))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![MakerBehavior::WrongHashlockKey, MakerBehavior::Normal];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || start_server(maker_clone).unwrap())
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    // The builder is the first hop, so its hashlock must derive from the next
+    // maker's key and the taker's nonce.
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("prepare must succeed");
+    let swap_error = taker
+        .start_swap(&summary.swap_id)
+        .expect_err("a swap with a wrong-key hashlock must fail");
+    assert!(
+        format!("{:?}", swap_error).contains("hashlock pubkey verification failed"),
+        "the hashlock check must be what stops the swap, got {:?}",
+        swap_error
+    );
+
+    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standing_of = |port: u16| {
+        standings
+            .iter()
+            .find(|m| m.address.to_string() == format!("127.0.0.1:{}", port))
+            .unwrap_or_else(|| panic!("maker on {} must be in the offerbook", port))
+            .state
+            .clone()
+    };
+
+    let builder = standing_of(makers[0].config.network_port);
+    assert!(
+        matches!(
+            builder,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "the wrong-hashlock builder must be banned, got {:?}",
+        builder
+    );
+
+    let honest = standing_of(makers[1].config.network_port);
+    assert!(
+        !matches!(honest, MakerState::Banned(_)),
+        "the honest maker must not be blamed, got {:?}",
+        honest
+    );
+
+    info!("Wrong hashlock key test completed successfully!");
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
+}
+
+/// The last maker takes the keys it was owed and hands back one that does not
+/// match. It is banned, and the taker still claims its coins by hashlock.
+#[test]
+fn wrong_handover_key_bans_the_last_maker() {
+    warn!("Running Test: Wrong Handover Key Bans The Last Maker");
+
+    let makers_config_map = vec![(23302, Some(22123)), (23402, Some(22124))];
+    let taker_behavior = vec![TakerBehavior::Normal];
+    let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::SendWrongHandoverKey];
+
+    let (test_framework, mut takers, makers, block_generation_handle) =
+        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+
+    let bitcoind = &test_framework.bitcoind;
+    let taker = takers.get_mut(0).unwrap();
+
+    fund_taker_default(taker, bitcoind, 3);
+    fund_makers_default(&makers, bitcoind);
+
+    let maker_threads = makers
+        .iter()
+        .map(|maker| {
+            let maker_clone = maker.clone();
+            thread::spawn(move || start_server(maker_clone).unwrap())
+        })
+        .collect::<Vec<_>>();
+
+    wait_for_makers_setup(&makers, 120);
+    generate_blocks(bitcoind, 1);
+
+    let swap_params = SwapParams::new(ProtocolVersion::Taproot, Amount::from_sat(500000), 2)
+        .with_tx_count(2)
+        .with_required_confirms(1);
+    let summary = taker
+        .prepare_swap(swap_params)
+        .expect("prepare must succeed");
+    assert!(
+        taker.start_swap(&summary.swap_id).is_err(),
+        "a swap with a wrong handover key must fail"
+    );
+
+    let standings = taker.fetch_offers().unwrap().all_makers();
+    let standing_of = |port: u16| {
+        standings
+            .iter()
+            .find(|m| m.address.to_string() == format!("127.0.0.1:{}", port))
+            .unwrap_or_else(|| panic!("maker on {} must be in the offerbook", port))
+            .state
+            .clone()
+    };
+
+    let last = standing_of(makers[1].config.network_port);
+    assert!(
+        matches!(
+            last,
+            MakerState::Banned(BanRecord {
+                reason: BanReason::ProvenViolation,
+                ..
+            })
+        ),
+        "the maker handing over a wrong key must be banned, got {:?}",
+        last
+    );
+
+    let honest = standing_of(makers[0].config.network_port);
+    assert!(
+        !matches!(honest, MakerState::Banned(_)),
+        "the honest maker must not be blamed, got {:?}",
+        honest
+    );
+
+    // The taker holds the preimage, so the background recovery claims the
+    // last maker's contract by hashlock without waiting on any timelock.
+    let recovery_start = Instant::now();
+    while !taker.is_recovery_complete() {
+        assert!(
+            recovery_start.elapsed() < Duration::from_secs(300),
+            "background recovery did not complete within timeout"
+        );
+        thread::sleep(Duration::from_secs(5));
+    }
+    generate_blocks(bitcoind, 1);
+    taker
+        .get_wallet()
+        .write()
+        .unwrap()
+        .sync_and_save(&NO_SHUTDOWN)
+        .unwrap();
+    let balances = taker.get_wallet().read().unwrap().get_balances().unwrap();
+    info!(
+        "Taker balances after recovery: Regular: {}, Swap: {}, Contract: {}, Spendable: {}",
+        balances.regular, balances.swap, balances.contract, balances.spendable,
+    );
+    assert_eq!(balances.regular.to_sat(), 14499692, "Taker regular balance");
+    assert_eq!(balances.swap.to_sat(), 497369, "Taker swap balance");
+    assert_eq!(balances.contract, Amount::ZERO, "Taker contract balance");
+
+    info!("Wrong handover key test completed successfully!");
+    shutdown_makers(&makers, maker_threads);
+    test_framework.stop();
+    block_generation_handle.join().unwrap();
 }

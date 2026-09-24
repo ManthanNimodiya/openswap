@@ -1302,10 +1302,7 @@ impl Taker {
                         .map(|s| s.payment.is_some())
                         .unwrap_or(false);
                     if !payment_swap && self.no_outgoing_funding_on_chain() {
-                        if let Some(spare) = {
-                            let swap = self.swap_state_mut()?;
-                            swap.spare_makers.pop()
-                        } {
+                        if let Some(spare) = self.take_eligible_spare()? {
                             log::warn!(
                                 "Pre-funding exchange failure, substituting maker 0 with spare"
                             );
@@ -1522,9 +1519,22 @@ impl Taker {
                 })
                 .collect();
 
+            // A ban outlives the route it was earned on, so naming a maker by
+            // address does not get past it. An address we have never seen is
+            // not banned, and stays usable.
+            let mut allowed = Vec::with_capacity(parsed.len());
+            for address in parsed {
+                if self.offerbook.is_banned(&address)? {
+                    log::warn!("Skipping banned preferred maker {address}");
+                    continue;
+                }
+                allowed.push(address);
+            }
+            let parsed = allowed;
+
             if parsed.len() < maker_count {
                 return Err(TakerError::General(format!(
-                    "Not enough valid preferred makers. Required: {}, Parsed: {}",
+                    "Not enough usable preferred makers. Required: {}, usable: {} (unreadable or banned addresses are dropped)",
                     maker_count,
                     parsed.len()
                 )));
@@ -1754,7 +1764,7 @@ impl Taker {
                             i, e
                         )));
                     }
-                    let spare = self.swap_state_mut()?.spare_makers.pop();
+                    let spare = self.take_eligible_spare()?;
                     if let Some(spare_addr) = spare {
                         log::info!("Substituting maker {} with spare at {}", i, spare_addr);
                         let mut replacement = MakerConnection::new(spare_addr, protocol, None);
@@ -2097,27 +2107,9 @@ impl Taker {
         maker_idx: usize,
         send_amount: Amount,
     ) -> Result<(), TakerError> {
-        // Fee percentage sanity: must be finite and non-negative, and < 100%
-        if offer.amount_relative_fee_pct.is_nan()
-            || offer.amount_relative_fee_pct.is_infinite()
-            || offer.amount_relative_fee_pct < 0.0
-            || offer.amount_relative_fee_pct >= 100.0
-        {
-            return Err(TakerError::General(format!(
-                "Maker {} offer has invalid amount_relative_fee_pct: {}",
-                maker_idx, offer.amount_relative_fee_pct
-            )));
-        }
-        if offer.time_relative_fee_pct.is_nan()
-            || offer.time_relative_fee_pct.is_infinite()
-            || offer.time_relative_fee_pct < 0.0
-            || offer.time_relative_fee_pct >= 100.0
-        {
-            return Err(TakerError::General(format!(
-                "Maker {} offer has invalid time_relative_fee_pct: {}",
-                maker_idx, offer.time_relative_fee_pct
-            )));
-        }
+        offer
+            .validate_shape()
+            .map_err(|e| TakerError::General(format!("Maker {maker_idx} {e}")))?;
 
         // Full maker fee must not consume or exceed the send amount
         let maker_fee = crate::protocol::contract::calculate_swap_fee(
@@ -2133,14 +2125,6 @@ impl Taker {
                 maker_idx,
                 maker_fee,
                 send_amount.to_sat()
-            )));
-        }
-
-        // Size limits must be consistent
-        if offer.min_size > offer.max_size {
-            return Err(TakerError::General(format!(
-                "Maker {} offer has min_size ({}) > max_size ({})",
-                maker_idx, offer.min_size, offer.max_size
             )));
         }
 
@@ -2162,60 +2146,20 @@ impl Taker {
         Ok(())
     }
 
-    /// Compute cumulative maker fees across all hops on a route and ensure they do not consume the send amount.
-    pub(crate) fn compute_route_maker_fees(
-        send_amount: Amount,
-        makers: &[(String, ProtocolVersion, Option<Offer>)],
-        per_hop_mining_fees: &[u64],
-    ) -> Result<(Vec<MakerFeeInfo>, u64), TakerError> {
-        let maker_count = makers.len();
-        let mut maker_fees = Vec::with_capacity(maker_count);
-        let mut amount_sats = send_amount.to_sat();
-
-        for (i, (address, protocol, offer_opt)) in makers.iter().enumerate() {
-            let locktime =
-                REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16;
-
-            let (base_fee, amt_pct, time_pct) = match offer_opt {
-                Some(offer) => (
-                    offer.base_fee,
-                    offer.amount_relative_fee_pct,
-                    offer.time_relative_fee_pct,
-                ),
-                None => (0, 0.0, 0.0),
+    /// Next spare with no ban on record. A banned spare is dropped rather than
+    /// returned, so it cannot end the retry that would have used it.
+    pub(crate) fn take_eligible_spare(&mut self) -> Result<Option<MakerAddress>, TakerError> {
+        loop {
+            let spare = self.swap_state_mut()?.spare_makers.pop();
+            let Some(spare) = spare else {
+                return Ok(None);
             };
-
-            let fee = base_fee as f64
-                + (amount_sats as f64 * amt_pct) / 100.0
-                + (amount_sats as f64 * locktime as f64 * time_pct) / 100.0;
-            let fee_sats = fee.ceil() as u64;
-
-            maker_fees.push(MakerFeeInfo {
-                address: address.clone(),
-                protocol: *protocol,
-                base_fee,
-                amount_relative_fee_pct: amt_pct,
-                time_relative_fee_pct: time_pct,
-                locktime,
-                estimated_fee_sats: fee_sats,
-            });
-
-            let per_hop_mining_fee = per_hop_mining_fees
-                .get(i)
-                .copied()
-                .or_else(|| per_hop_mining_fees.last().copied())
-                .unwrap_or(0);
-            amount_sats = amount_sats.saturating_sub(fee_sats + per_hop_mining_fee);
+            if self.offerbook.is_banned(&spare)? {
+                log::warn!("Skipping banned spare maker {spare}");
+                continue;
+            }
+            return Ok(Some(spare));
         }
-
-        let total_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
-        if total_fee_sats >= send_amount.to_sat() {
-            return Err(TakerError::General(
-                "Cumulative maker fees consume the send amount".into(),
-            ));
-        }
-
-        Ok((maker_fees, total_fee_sats))
     }
 
     /// Put a spare in a failed maker's place and negotiate only with it.
@@ -2232,6 +2176,14 @@ impl Taker {
             target_idx,
             spare_addr
         );
+
+        // Spares are picked at discovery and used much later, by which time one
+        // may have earned a ban.
+        if self.offerbook.is_banned(&spare_addr)? {
+            return Err(TakerError::General(format!(
+                "Spare maker {spare_addr} is banned"
+            )));
+        }
 
         // Payment routes are priced against the exact makers they were solved
         // for; substitution would invalidate the gross.
@@ -2728,10 +2680,20 @@ impl Taker {
             // maker from sending a garbage key that would make funds unspendable.
             if i == num_makers - 1 {
                 let secp = bitcoin::secp256k1::Secp256k1::new();
-                let incoming = &mut self.swap_state_mut()?.incoming_swapcoins;
-                for (incoming, received_privkey) in
-                    incoming.iter_mut().zip(received_privkeys.iter())
-                {
+                let incoming = &self.swap_state()?.incoming_swapcoins;
+                // `zip` stops at the shorter side, so a short reply would leave
+                // later swapcoins without the key that makes them spendable.
+                if received_privkeys.len() != incoming.len() {
+                    self.note_proven_violation(i);
+                    return Err(TakerError::General(format!(
+                        "Last maker {} sent {} private keys for {} incoming swapcoins",
+                        i,
+                        received_privkeys.len(),
+                        incoming.len()
+                    )));
+                }
+
+                for (incoming, received_privkey) in incoming.iter().zip(received_privkeys.iter()) {
                     let derived_pubkey = PublicKey {
                         compressed: true,
                         inner: bitcoin::secp256k1::PublicKey::from_secret_key(
@@ -2739,15 +2701,28 @@ impl Taker {
                             received_privkey,
                         ),
                     };
-                    if let Some(expected_pubkey) = incoming.other_pubkey {
-                        if derived_pubkey != expected_pubkey {
-                            return Err(TakerError::General(format!(
-                                "Last maker {} sent incorrect private key: derived pubkey {} \
-                                 does not match expected {}",
-                                i, derived_pubkey, expected_pubkey
-                            )));
-                        }
+                    // Without the expected key there is nothing to check against,
+                    // and an unchecked key can leave the coin unspendable.
+                    let Some(expected_pubkey) = incoming.other_pubkey else {
+                        return Err(TakerError::General(format!(
+                            "Incoming swapcoin has no expected pubkey to check maker {i}'s key"
+                        )));
+                    };
+                    if derived_pubkey != expected_pubkey {
+                        self.note_proven_violation(i);
+                        return Err(TakerError::General(format!(
+                            "Last maker {} sent incorrect private key: derived pubkey {} \
+                             does not match expected {}",
+                            i, derived_pubkey, expected_pubkey
+                        )));
                     }
+                }
+                for (incoming, received_privkey) in self
+                    .swap_state_mut()?
+                    .incoming_swapcoins
+                    .iter_mut()
+                    .zip(received_privkeys.iter())
+                {
                     incoming.set_other_privkey(*received_privkey);
                 }
                 log::info!(

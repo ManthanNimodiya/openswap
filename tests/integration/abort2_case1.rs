@@ -8,7 +8,7 @@ use bitcoin::Amount;
 use openswap::{
     maker::{start_server, MakerBehavior, MakerServer},
     protocol::common_messages::{MakerToTakerMessage, ProtocolVersion},
-    taker::{SwapParams, SwapSummary, Taker, TakerBehavior},
+    taker::{MakerState, SwapParams, SwapSummary, Taker, TakerBehavior},
 };
 
 use super::test_framework::*;
@@ -25,7 +25,7 @@ use std::{
 fn maker_abort2_case1() {
     warn!("Running Test: Maker drops before sending sender's sigs. Taker continues with spare.");
 
-    let makers_config_map = vec![(6102, None), (16102, None), (26102, None)];
+    let maker_count = 3;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -34,7 +34,7 @@ fn maker_abort2_case1() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -134,6 +134,21 @@ fn maker_abort2_case1() {
             i
         );
         assert_eq!(balances.fidelity, Amount::from_btc(0.05).unwrap());
+    }
+
+    // Maker 1 dropped the connection. We cannot tell its failure from our own
+    // link failing, so nothing about it may be recorded as its fault.
+    let standings = taker.fetch_offers().unwrap().all_makers();
+    for maker in &makers {
+        let address = format!("127.0.0.1:{}", maker.config.network_port);
+        if let Some(standing) = standings.iter().find(|m| m.address.to_string() == address) {
+            assert!(
+                !matches!(standing.state, MakerState::Banned(_)),
+                "a dropped connection must blame nobody, but {} is {:?}",
+                address,
+                standing.state
+            );
+        }
     }
 
     info!("maker_abort2_case1 completed successfully!");
