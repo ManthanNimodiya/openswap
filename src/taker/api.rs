@@ -2146,6 +2146,62 @@ impl Taker {
         Ok(())
     }
 
+    /// Compute cumulative maker fees across all hops on a route and ensure they do not consume the send amount.
+    pub(crate) fn compute_route_maker_fees(
+        send_amount: Amount,
+        makers: &[(String, ProtocolVersion, Option<Offer>)],
+        per_hop_mining_fees: &[u64],
+    ) -> Result<(Vec<MakerFeeInfo>, u64), TakerError> {
+        let maker_count = makers.len();
+        let mut maker_fees = Vec::with_capacity(maker_count);
+        let mut amount_sats = send_amount.to_sat();
+
+        for (i, (address, protocol, offer_opt)) in makers.iter().enumerate() {
+            let locktime =
+                REFUND_LOCKTIME_BASE + REFUND_LOCKTIME_STEP * (maker_count - i - 1) as u16;
+
+            let (base_fee, amt_pct, time_pct) = match offer_opt {
+                Some(offer) => (
+                    offer.base_fee,
+                    offer.amount_relative_fee_pct,
+                    offer.time_relative_fee_pct,
+                ),
+                None => (0, 0.0, 0.0),
+            };
+
+            let fee = base_fee as f64
+                + (amount_sats as f64 * amt_pct) / 100.0
+                + (amount_sats as f64 * locktime as f64 * time_pct) / 100.0;
+            let fee_sats = fee.ceil() as u64;
+
+            maker_fees.push(MakerFeeInfo {
+                address: address.clone(),
+                protocol: *protocol,
+                base_fee,
+                amount_relative_fee_pct: amt_pct,
+                time_relative_fee_pct: time_pct,
+                locktime,
+                estimated_fee_sats: fee_sats,
+            });
+
+            let per_hop_mining_fee = per_hop_mining_fees
+                .get(i)
+                .copied()
+                .or_else(|| per_hop_mining_fees.last().copied())
+                .unwrap_or(0);
+            amount_sats = amount_sats.saturating_sub(fee_sats + per_hop_mining_fee);
+        }
+
+        let total_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
+        if total_fee_sats >= send_amount.to_sat() {
+            return Err(TakerError::General(
+                "Cumulative maker fees consume the send amount".into(),
+            ));
+        }
+
+        Ok((maker_fees, total_fee_sats))
+    }
+
     /// Next spare with no ban on record. A banned spare is dropped rather than
     /// returned, so it cannot end the retry that would have used it.
     pub(crate) fn take_eligible_spare(&mut self) -> Result<Option<MakerAddress>, TakerError> {

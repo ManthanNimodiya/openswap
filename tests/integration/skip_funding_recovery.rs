@@ -591,12 +591,11 @@ fn run_taproot_timelock_only_recovery<B: TestBackend>() {
 /// that maker alone is banned.
 fn run_withheld_funding_bans_its_maker<B: TestBackend>(
     protocol: ProtocolVersion,
-    maker1: (u16, u16),
-    maker2: (u16, u16),
+    _maker1: (u16, u16),
+    _maker2: (u16, u16),
 ) {
     warn!("Running Test: Withheld Funding Bans Its Maker ({protocol:?})");
 
-    let makers_config_map = vec![(maker1.0, Some(maker1.1)), (maker2.0, Some(maker2.1))];
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::Normal,
@@ -604,7 +603,7 @@ fn run_withheld_funding_bans_its_maker<B: TestBackend>(
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<B>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<B>(2, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
