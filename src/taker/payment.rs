@@ -692,7 +692,7 @@ mod tests {
             ),
         ];
 
-        let err = Taker::compute_route_maker_fees(Amount::from_sat(1000), &hops, 0).unwrap_err();
+        let err = Taker::compute_route_maker_fees(Amount::from_sat(1000), &hops, &[0]).unwrap_err();
         assert!(
             matches!(err, TakerError::General(ref msg) if msg.contains("Cumulative maker fees consume the send amount")),
             "Expected cumulative fee exhaustion error, got: {:?}",
@@ -781,9 +781,16 @@ mod tests {
         ];
 
         let (fees, total) =
-            Taker::compute_route_maker_fees(Amount::from_sat(10_000), &hops, 500).unwrap();
+            Taker::compute_route_maker_fees(Amount::from_sat(10_000), &hops, &[500]).unwrap();
         assert_eq!(fees[0].estimated_fee_sats, 1000);
         assert_eq!(fees[1].estimated_fee_sats, 850);
         assert_eq!(total, 1850);
+
+        // Heterogeneous per-hop fees: [500, 200]
+        let (fees_hetero, total_hetero) =
+            Taker::compute_route_maker_fees(Amount::from_sat(10_000), &hops, &[500, 200]).unwrap();
+        assert_eq!(fees_hetero[0].estimated_fee_sats, 1000);
+        assert_eq!(fees_hetero[1].estimated_fee_sats, 850);
+        assert_eq!(total_hetero, 1850);
     }
 }

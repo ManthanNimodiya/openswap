@@ -1120,12 +1120,6 @@ impl Taker {
             .iter()
             .map(|mc| (mc.address.to_string(), mc.protocol, mc.offer.clone()))
             .collect();
-        let per_hop_mining_fee =
-            crate::utill::estimate_funding_tx_fee_sats() * swap.params.tx_count as u64;
-        let (maker_fees, _total_service_fee) =
-            Self::compute_route_maker_fees(send_amount, &maker_hops, per_hop_mining_fee)?;
-        let service_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
-
         // The headline number is a ceiling, so every cost is priced at its
         // negotiated maximum: all splits delivered at the full input budget
         // and every incoming contract swept at policy price.
@@ -1138,7 +1132,8 @@ impl Taker {
         )
         .ok_or_else(policy_err)?;
         let tx_count = swap.params.tx_count as u64;
-        let mut ceiling_sats = service_fee_sats;
+
+        let mut per_hop_mining_fees = Vec::with_capacity(swap.makers.len());
         for mc in &swap.makers {
             let sweep_sats =
                 sweep_fee_policy_sats(mc.protocol, swap_feerate).ok_or_else(policy_err)?;
@@ -1146,6 +1141,15 @@ impl Taker {
                 .checked_add(sweep_sats)
                 .and_then(|per_split| tx_count.checked_mul(per_split))
                 .ok_or_else(policy_err)?;
+            per_hop_mining_fees.push(hop_sats);
+        }
+
+        let (maker_fees, _total_service_fee) =
+            Self::compute_route_maker_fees(send_amount, &maker_hops, &per_hop_mining_fees)?;
+        let service_fee_sats: u64 = maker_fees.iter().map(|m| m.estimated_fee_sats).sum();
+
+        let mut ceiling_sats = service_fee_sats;
+        for &hop_sats in &per_hop_mining_fees {
             ceiling_sats = ceiling_sats.checked_add(hop_sats).ok_or_else(policy_err)?;
         }
         // The taker's own hop-0 funding pays its real plan: hop 0 has no input
@@ -1635,6 +1639,8 @@ impl Taker {
         let planned_hop0 = {
             let swap = self.swap_state()?;
             let wallet = self.read_wallet()?;
+            let split_floor =
+                crate::utill::per_output_floor(swap.params.protocol, swap.params.swap_feerate());
             wallet.plan_funding(
                 send_amount,
                 tx_count,
@@ -1645,6 +1651,7 @@ impl Taker {
                 None,
                 swap.params.manually_selected_outpoints.clone(),
                 None,
+                Some(split_floor),
             )?
         };
         let planned_hop0_count = planned_hop0.len() as u32;
@@ -2159,7 +2166,7 @@ impl Taker {
     pub(crate) fn compute_route_maker_fees(
         send_amount: Amount,
         makers: &[(String, ProtocolVersion, Option<Offer>)],
-        per_hop_mining_fee: u64,
+        per_hop_mining_fees: &[u64],
     ) -> Result<(Vec<MakerFeeInfo>, u64), TakerError> {
         let maker_count = makers.len();
         let mut maker_fees = Vec::with_capacity(maker_count);
@@ -2193,6 +2200,11 @@ impl Taker {
                 estimated_fee_sats: fee_sats,
             });
 
+            let per_hop_mining_fee = per_hop_mining_fees
+                .get(i)
+                .copied()
+                .or_else(|| per_hop_mining_fees.last().copied())
+                .unwrap_or(0);
             amount_sats = amount_sats.saturating_sub(fee_sats + per_hop_mining_fee);
         }
 
@@ -3550,6 +3562,7 @@ pub(crate) fn fund_all_or_nothing(
     destinations: &[bitcoin::Address],
     feerate: f64,
     manually_selected_outpoints: Option<Vec<OutPoint>>,
+    split_floor: Option<u64>,
 ) -> Result<CreateFundingTxesResult, TakerError> {
     let plan = wallet.plan_funding(
         send_amount,
@@ -3559,6 +3572,7 @@ pub(crate) fn fund_all_or_nothing(
         None,
         manually_selected_outpoints,
         None,
+        split_floor,
     )?;
     if plan.len() != destinations.len() {
         return Err(TakerError::General(format!(

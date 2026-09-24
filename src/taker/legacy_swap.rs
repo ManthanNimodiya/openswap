@@ -87,12 +87,15 @@ impl Taker {
             ));
         }
 
+        let split_floor =
+            crate::utill::per_output_floor(crate::protocol::ProtocolVersion::Legacy, feerate);
         let funding_result = fund_all_or_nothing(
             wallet,
             send_amount,
             &openswap_addresses,
             feerate,
             manually_selected_outpoints,
+            Some(split_floor),
         )?;
 
         for (

@@ -153,12 +153,15 @@ impl Taker {
             ));
         }
 
+        let split_floor =
+            crate::utill::per_output_floor(crate::protocol::ProtocolVersion::Taproot, feerate);
         let funding_result = fund_all_or_nothing(
             wallet,
             send_amount,
             &taproot_addresses,
             feerate,
             manually_selected_outpoints,
+            Some(split_floor),
         )?;
 
         for (

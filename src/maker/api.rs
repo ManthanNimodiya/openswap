@@ -1295,6 +1295,7 @@ impl MakerServer {
             .checked_sub(state.service_fee_sats)
             .and_then(|rest| rest.checked_sub(sweep_fee))
             .ok_or(MakerError::General("Swap fees exceed the declared amount"))?;
+        let split_floor = crate::utill::per_output_floor(state.protocol, state.swap_feerate);
         let wallet = lock_debug!(self.wallet.read())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?;
         let mut plan = wallet
@@ -1306,6 +1307,7 @@ impl MakerServer {
                 Some(state.service_fee_sats),
                 None,
                 None,
+                Some(split_floor),
             )
             .map_err(|e| {
                 log::warn!(
@@ -1332,7 +1334,13 @@ impl MakerServer {
             })?;
         // Forwarding nets the taker-reimbursed fee out of each split; a split
         // the netting pushes below the floor is a refusal, not a smaller swap.
-        net_policy_fees(&mut plan, state.max_input_budget, state.swap_feerate).map_err(|e| {
+        net_policy_fees(
+            &mut plan,
+            state.max_input_budget,
+            state.swap_feerate,
+            Some(split_floor),
+        )
+        .map_err(|e| {
             log::warn!(
                 "[{}] Rejecting swap at admission: policy netting failed: {:?}",
                 self.config.network_port,
@@ -1463,6 +1471,26 @@ fn live_swap_holds(
     })
 }
 
+/// Compute the minimum swap amount required to fund `tx_count` split outputs above the
+/// spendability floor after deducting own maker fees and peer incoming contract sweep fees.
+pub(crate) fn swap_output_spendability_floor(
+    protocol: ProtocolVersion,
+    feerate: f64,
+    tx_count: u32,
+    incoming_count: u32,
+    own_fee: u64,
+) -> Option<u64> {
+    let per_output = crate::utill::per_output_floor(protocol, feerate);
+    let output_minimum = (tx_count.max(1) as u64).saturating_mul(per_output);
+    let sweep_fee = crate::utill::sweep_fee_policy_sats(protocol, feerate)
+        .and_then(|per_contract| per_contract.checked_mul(incoming_count as u64))?;
+    Some(
+        own_fee
+            .saturating_add(sweep_fee)
+            .saturating_add(output_minimum),
+    )
+}
+
 impl MakerTrait for MakerServer {
     fn network_port(&self) -> u16 {
         self.config.network_port
@@ -1558,14 +1586,19 @@ impl MakerTrait for MakerServer {
 
         // Technical constraint 2: Each split output must be above dust and cover its spend cost
         let feerate_f64 = details.feerate as f64;
-        let per_output = crate::utill::per_output_floor(details.protocol_version, feerate_f64);
-        let output_minimum = (details.tx_count.max(1) as u64).saturating_mul(per_output);
-        if amount_sat < output_minimum {
+        let min_required = swap_output_spendability_floor(
+            details.protocol_version,
+            feerate_f64,
+            details.tx_count,
+            details.incoming_count,
+            own_fee,
+        )
+        .ok_or(MakerError::General("Sweep fee arithmetic overflow"))?;
+        if amount_sat < min_required {
             log::warn!(
-                "Swap amount {} sats is below output spendability floor {} sats (tx_count={})",
+                "Swap amount {} sats cannot cover maker fee ({} sats) + sweep fee + output spendability floor",
                 amount_sat,
-                output_minimum,
-                details.tx_count
+                own_fee
             );
             return Err(MakerError::General(
                 "Swap amount below output spendability floor",
@@ -2859,6 +2892,25 @@ mod tests {
         )
         .unwrap();
         assert!(MakerServerConfig::new(Some(&path)).is_err());
+    }
+
+    #[test]
+    fn swap_output_spendability_floor_accounts_for_deductions() {
+        use crate::protocol::ProtocolVersion;
+        // Taproot at 2 sat/vB:
+        // per_output_floor = 330 dust + 114*2 spend_fee = 558 sats.
+        // sweep_fee = 110 * 2 = 220 sats.
+        // With own_fee = 10 sats:
+        // min_required = 10 + 220 + 558 = 788 sats.
+        let floor =
+            super::swap_output_spendability_floor(ProtocolVersion::Taproot, 2.0, 1, 1, 10).unwrap();
+        assert_eq!(floor, 788);
+
+        // A swap amount of 600 sats would exceed the 550 sat output minimum in isolation,
+        // but cannot fund the output once own fee and sweep fee deductions are netted.
+        assert!(600 < floor);
+        // A swap amount of 1,000 sats covers the full floor.
+        assert!(1_000 >= floor);
     }
 
     /// Keeps wallet inspection usable without clearing the terminal server latch.
