@@ -414,12 +414,14 @@ pub trait Maker: Send + Sync {
 
     /// True if any Legacy incoming funding outpoint for this swap has already
     /// been spent by its own expected contract txid — the counterparty
-    /// forcing the contract on-chain before the swap finished. Sentinels must
-    /// already be armed by `process_proof_of_funding`; an unknown swap id
-    /// reads as not breached (nothing to protect), but a watcher that cannot
-    /// answer is returned as `Err`, not `Ok(false)` — this gate has to fail
-    /// closed, since a false negative here can end in the counterparty
-    /// receiving our outgoing private key.
+    /// forcing the contract on-chain before the swap finished. Checked with a
+    /// fresh backend query, not the watch service's cache: this gates a
+    /// private key handover, and a broadcast the watcher has not caught up to
+    /// yet must not read as "no breach". For the same reason this fails
+    /// closed — a swap id with no tracked state, or a backend query that
+    /// cannot answer, is returned as `Err`, never `Ok(false)`. A false
+    /// negative here can end in the counterparty receiving our outgoing
+    /// private key.
     fn legacy_swap_breached(&self, swap_id: &str) -> Result<bool, MakerError>;
 
     /// Sync wallet with Bitcoin Core and save state to disk.

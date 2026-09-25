@@ -1225,11 +1225,16 @@ impl MakerServer {
     /// True if any funding outpoint in `incoming` has been spent by its own
     /// contract txid. Sentinels are polled through the watch service's own
     /// cache (armed by `process_proof_of_funding`), so this never makes a
-    /// fresh backend call. A watcher error is returned to the caller instead
-    /// of read as "not breached": the synchronous gates in
-    /// `legacy_swap_breached` must fail closed on it, and only
-    /// `drain_breached_swaps`'s background loop — which gets another try
-    /// next heartbeat — chooses to log and continue.
+    /// fresh backend call — the watcher thread has to have already ingested
+    /// the spend for this to see it. Used only by `drain_breached_swaps`'s
+    /// background loop, which gets another try next heartbeat regardless; a
+    /// watcher error is returned to the caller rather than read as "not
+    /// breached", so a failing watcher does not look identical to "clean".
+    ///
+    /// The synchronous gates in `legacy_swap_breached` must not use this: a
+    /// broadcast the watcher has not caught up to yet would read as no
+    /// breach right before we hand over a private key. They use
+    /// `legacy_incoming_funding_breached_fresh` instead.
     fn legacy_incoming_funding_breached(
         &self,
         incoming: &[IncomingSwapCoin],
@@ -1257,6 +1262,41 @@ impl MakerServer {
                         .leak(),
                     ));
                 }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fresh, un-cached counterpart to `legacy_incoming_funding_breached` for
+    /// the synchronous gates. Queries the backend directly for each funding
+    /// outpoint instead of the watcher's own registry, so a broadcast that
+    /// just landed — before the watcher thread has processed it — still
+    /// shows up here. A backend error is returned rather than read as "not
+    /// breached": the caller must fail closed, not release a private key on
+    /// an inconclusive check.
+    fn legacy_incoming_funding_breached_fresh(
+        &self,
+        incoming: &[IncomingSwapCoin],
+    ) -> Result<bool, MakerError> {
+        let wallet = lock_debug!(self.wallet.read())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?;
+        for sc in incoming {
+            let Some(funding_input) = sc.contract_tx.input.first() else {
+                continue;
+            };
+            let Some(multisig_redeemscript) = sc.multisig_redeemscript.as_ref() else {
+                continue;
+            };
+            let funding_spk = crate::utill::redeemscript_to_scriptpubkey(multisig_redeemscript)?;
+            let expected_txid = sc.contract_tx.compute_txid();
+            match wallet.blockchain.spending_transaction(
+                &funding_input.previous_output,
+                funding_spk.as_script(),
+                Some(&expected_txid),
+            ) {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => {}
+                Err(e) => return Err(MakerError::Wallet(e)),
             }
         }
         Ok(false)
@@ -1980,10 +2020,15 @@ impl MakerTrait for MakerServer {
                 lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
             match swaps.get(swap_id) {
                 Some(state) => state.incoming_swapcoins.clone(),
-                None => return Ok(false),
+                // Reachable if `drain_breached_swaps` already pulled this
+                // swap out from under a concurrent handler: it raced us
+                // because it found a breach, so an absent entry here must
+                // not read as "clean" — that would hand over the private
+                // key for a swap already flagged and headed to recovery.
+                None => return Err(MakerError::General("No tracked swap state")),
             }
         };
-        self.legacy_incoming_funding_breached(&incoming)
+        self.legacy_incoming_funding_breached_fresh(&incoming)
     }
 
     fn sync_and_save_wallet(&self) -> Result<(), MakerError> {
