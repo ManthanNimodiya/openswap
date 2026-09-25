@@ -1222,6 +1222,94 @@ impl MakerServer {
         Ok(idle)
     }
 
+    /// True if any funding outpoint in `incoming` has been spent by its own
+    /// contract txid. Sentinels are polled through the watch service's own
+    /// cache (armed by `process_proof_of_funding`), so this never makes a
+    /// fresh backend call; a watcher error is logged and read as not
+    /// breached — the idle timeout and refund deadline stay the fallback.
+    fn legacy_incoming_funding_breached(&self, incoming: &[IncomingSwapCoin]) -> bool {
+        for sc in incoming {
+            let Some(funding_input) = sc.contract_tx.input.first() else {
+                continue;
+            };
+            let expected_txid = sc.contract_tx.compute_txid();
+            match self
+                .watch_service
+                .watch_request(funding_input.previous_output)
+            {
+                Ok(crate::watch_tower::watcher::WatcherEvent::UtxoSpent {
+                    spending_tx: Some(tx),
+                    ..
+                }) if tx.compute_txid() == expected_txid => return true,
+                Ok(_) => {}
+                Err(e) => {
+                    log::error!(
+                        "[{}] breach watch query for {} failed: {e}",
+                        self.config.network_port,
+                        funding_input.previous_output
+                    );
+                }
+            }
+        }
+        false
+    }
+
+    /// Removes and returns swap data for any Legacy swap whose incoming
+    /// funding outpoint has been spent by its own expected contract txid —
+    /// the counterparty forcing the contract on-chain before the swap
+    /// finished. Runs independently of the idle timeout, so `check_for_idle_states`
+    /// starts recovery within one heartbeat instead of waiting out
+    /// `IDLE_CONNECTION_TIMEOUT`.
+    pub fn drain_breached_swaps(&self) -> Result<Vec<IdleSwapData>, MakerError> {
+        // Snapshot candidates before any watcher round trip: the watcher lives
+        // behind its own channel, and holding `ongoing_swaps` across that call
+        // would stall every handler touching an unrelated swap.
+        let candidates: Vec<(String, Vec<IncomingSwapCoin>)> = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            swaps
+                .iter()
+                .filter(|(_, state)| {
+                    state.phase != SwapPhase::Completed && !state.incoming_swapcoins.is_empty()
+                })
+                .map(|(id, state)| (id.clone(), state.incoming_swapcoins.clone()))
+                .collect()
+        };
+
+        let mut breached_ids = Vec::new();
+        for (id, incoming) in &candidates {
+            if self.legacy_incoming_funding_breached(incoming) {
+                log::error!(
+                    "[{}] Swap {} breached: incoming funding outpoint spent by its own contract tx before the swap finished. Recovering now.",
+                    self.config.network_port,
+                    id
+                );
+                breached_ids.push(id.clone());
+            }
+        }
+
+        if breached_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut swaps =
+            lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+        let mut breached = Vec::with_capacity(breached_ids.len());
+        for id in breached_ids {
+            if let Some(state) = swaps.remove(&id) {
+                breached.push(IdleSwapData {
+                    swap_id: id,
+                    protocol: state.negotiated.protocol,
+                    swap_amount_sat: state.negotiated.swap_amount.to_sat(),
+                    incoming_swapcoins: state.incoming_swapcoins,
+                    outgoing_swapcoins: state.outgoing_swapcoins,
+                    funding_broadcast_txids: state.funding_broadcast_txids,
+                });
+            }
+        }
+        Ok(breached)
+    }
+
     /// Remove a completed swap's entry from `ongoing_swaps`.
     pub fn remove_swap_state(&self, swap_id: &str) -> Result<(), MakerError> {
         lock_debug!(self.ongoing_swaps.lock())
@@ -1865,6 +1953,18 @@ impl MakerTrait for MakerServer {
         if let Err(e) = self.watch_service.unwatch(outpoint, script_pubkey) {
             log::error!("unwatch for {outpoint} failed (watcher gone): {e}");
         }
+    }
+
+    fn legacy_swap_breached(&self, swap_id: &str) -> Result<bool, MakerError> {
+        let incoming = {
+            let swaps =
+                lock_debug!(self.ongoing_swaps.lock()).map_err(|_| MakerError::MutexPossion)?;
+            match swaps.get(swap_id) {
+                Some(state) => state.incoming_swapcoins.clone(),
+                None => return Ok(false),
+            }
+        };
+        Ok(self.legacy_incoming_funding_breached(&incoming))
     }
 
     fn sync_and_save_wallet(&self) -> Result<(), MakerError> {

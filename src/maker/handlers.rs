@@ -412,6 +412,15 @@ pub trait Maker: Send + Sync {
     /// Unregister outpoint from watching (after swap completion).
     fn unwatch_outpoint(&self, outpoint: bitcoin::OutPoint, script_pubkey: bitcoin::ScriptBuf);
 
+    /// True if any Legacy incoming funding outpoint for this swap has already
+    /// been spent by its own expected contract txid — the counterparty
+    /// forcing the contract on-chain before the swap finished. Sentinels must
+    /// already be armed by `process_proof_of_funding`; an unknown swap id or
+    /// a watcher that cannot answer reads as not breached, matching the
+    /// watcher's `NoOutpoint`/error answers — the idle timeout and refund
+    /// deadline remain the fallback for those cases.
+    fn legacy_swap_breached(&self, swap_id: &str) -> Result<bool, MakerError>;
+
     /// Sync wallet with Bitcoin Core and save state to disk.
     fn sync_and_save_wallet(&self) -> Result<(), MakerError>;
 

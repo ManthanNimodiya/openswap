@@ -25,7 +25,7 @@ use crate::{
 };
 
 use super::{
-    api::MakerServer,
+    api::{IdleSwapData, MakerServer},
     error::MakerError,
     handlers::{
         emit_maker_success_report, handle_message, ConnectionState, Maker, MAX_CONCURRENT_SWAPS,
@@ -727,9 +727,9 @@ fn swap_is_quiet(maker: &Arc<MakerServer>, state: &ConnectionState) -> bool {
     }
 }
 
-/// Background thread that checks for idle swap states and spawns recovery.
+/// Background thread that checks for idle and breached swap states and spawns recovery.
 fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
-    use super::swap_tracker::{now_secs, MakerRecoveryState, MakerSwapPhase, MakerSwapRecord};
+    use super::swap_tracker::MakerSwapPhase;
 
     loop {
         if maker.is_shutdown() {
@@ -737,63 +737,26 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
         }
 
         let idle_swaps = maker.drain_idle_swaps(IDLE_CONNECTION_TIMEOUT)?;
-
         for idle in idle_swaps {
             log::error!(
                 "[{}] Potential dropped connection from taker. Swap {} idle. Recovering from swap",
                 maker.config.network_port,
                 idle.swap_id
             );
+            spawn_swap_recovery(&maker, idle, MakerSwapPhase::TakerDropped)?;
+        }
 
-            // Create a tracker record for this dropped swap.
-            let now = now_secs();
-            let record = MakerSwapRecord {
-                swap_id: idle.swap_id.clone(),
-                protocol: idle.protocol,
-                phase: MakerSwapPhase::TakerDropped,
-                swap_amount_sat: idle.swap_amount_sat,
-                incoming_count: idle.incoming_swapcoins.len(),
-                outgoing_count: idle.outgoing_swapcoins.len(),
-                funding_broadcast_txids: idle.funding_broadcast_txids.clone(),
-                recovery: MakerRecoveryState::default(),
-                created_at: now,
-                updated_at: now,
-            };
-
-            if let Err(e) = lock_debug!(maker.swap_tracker.lock())
-                .map_err(|_| MakerError::MutexPossion)?
-                .save_record(&record)
-            {
-                log::error!("Failed to save swap tracker record: {:?}", e);
-            }
-
-            // A crashed process never reaches its idle recovery, so the contracts
-            // stay unclaimed until a restart picks them up.
-            #[cfg(feature = "integration-test")]
-            if maker.behavior == super::handlers::MakerBehavior::CrashBeforeRecovery {
-                log::warn!(
-                    "[{}] Test behavior: crashing instead of recovering",
-                    maker.config.network_port
-                );
-                continue;
-            }
-
-            let swap_id = idle.swap_id.clone();
-            let maker_clone = Arc::clone(&maker);
-            let handle = thread::Builder::new()
-                .name(format!("swap-recovery-{}", swap_id))
-                .spawn(move || {
-                    if let Err(e) = recover_from_swap(
-                        maker_clone,
-                        idle.swap_id,
-                        idle.incoming_swapcoins,
-                        idle.outgoing_swapcoins,
-                    ) {
-                        log::error!("Failed to recover from swap {}: {:?}", swap_id, e);
-                    }
-                })
-                .map_err(MakerError::IO)?;
-            maker.thread_pool.add_thread(handle)?;
+        // Independent of the idle timeout: a breach is active malice with the
+        // connection still open, not a dropped connection, and recovery must
+        // not wait out `IDLE_CONNECTION_TIMEOUT` to start.
+        let breached_swaps = maker.drain_breached_swaps()?;
+        for breached in breached_swaps {
+            log::error!(
+                "[{}] Swap {} breached: taker forced the contract on-chain before the swap finished. Recovering now.",
+                maker.config.network_port,
+                breached.swap_id
+            );
+            spawn_swap_recovery(&maker, breached, MakerSwapPhase::Breached)?;
         }
 
         if !maker.wait_for_shutdown(HEART_BEAT_INTERVAL) {
@@ -802,6 +765,66 @@ fn check_for_idle_states(maker: Arc<MakerServer>) -> Result<(), MakerError> {
     }
 
     Ok(())
+}
+
+/// Persist a tracker record for a swap pulled out of `ongoing_swaps` and spawn
+/// its recovery thread. Shared by the idle-drop and breach-detection paths in
+/// `check_for_idle_states`; only the log line and tracker phase differ.
+fn spawn_swap_recovery(
+    maker: &Arc<MakerServer>,
+    idle: IdleSwapData,
+    phase: super::swap_tracker::MakerSwapPhase,
+) -> Result<(), MakerError> {
+    use super::swap_tracker::{now_secs, MakerRecoveryState, MakerSwapRecord};
+
+    let now = now_secs();
+    let record = MakerSwapRecord {
+        swap_id: idle.swap_id.clone(),
+        protocol: idle.protocol,
+        phase,
+        swap_amount_sat: idle.swap_amount_sat,
+        incoming_count: idle.incoming_swapcoins.len(),
+        outgoing_count: idle.outgoing_swapcoins.len(),
+        funding_broadcast_txids: idle.funding_broadcast_txids.clone(),
+        recovery: MakerRecoveryState::default(),
+        created_at: now,
+        updated_at: now,
+    };
+
+    if let Err(e) = lock_debug!(maker.swap_tracker.lock())
+        .map_err(|_| MakerError::MutexPossion)?
+        .save_record(&record)
+    {
+        log::error!("Failed to save swap tracker record: {:?}", e);
+    }
+
+    // A crashed process never reaches its idle recovery, so the contracts
+    // stay unclaimed until a restart picks them up.
+    #[cfg(feature = "integration-test")]
+    if maker.behavior == super::handlers::MakerBehavior::CrashBeforeRecovery {
+        log::warn!(
+            "[{}] Test behavior: crashing instead of recovering",
+            maker.config.network_port
+        );
+        return Ok(());
+    }
+
+    let swap_id = idle.swap_id.clone();
+    let maker_clone = Arc::clone(maker);
+    let handle = thread::Builder::new()
+        .name(format!("swap-recovery-{}", swap_id))
+        .spawn(move || {
+            if let Err(e) = recover_from_swap(
+                maker_clone,
+                idle.swap_id,
+                idle.incoming_swapcoins,
+                idle.outgoing_swapcoins,
+            ) {
+                log::error!("Failed to recover from swap {}: {:?}", swap_id, e);
+            }
+        })
+        .map_err(MakerError::IO)?;
+    maker.thread_pool.add_thread(handle)
 }
 
 /// Periodically check for expired fidelity bonds and renew them.

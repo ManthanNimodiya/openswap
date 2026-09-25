@@ -1411,6 +1411,22 @@ impl Taker {
         }
 
         #[cfg(feature = "integration-test")]
+        if self.behavior == TakerBehavior::BroadcastContractDuringSwap {
+            log::warn!(
+                "Test behavior: broadcasting contract txs after full setup, then continuing the swap"
+            );
+            // Same adversarial broadcast as `BroadcastContractAfterFullSetup`,
+            // but the connection stays open and the swap keeps going: the
+            // maker must catch this on its own, not rely on the taker
+            // dropping the connection.
+            let wallet = self.read_wallet()?;
+            for outgoing in &self.swap_state()?.outgoing_swapcoins {
+                let _ = wallet.send_tx(&outgoing.contract_tx);
+            }
+            drop(wallet);
+        }
+
+        #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::DropAfterFundsBroadcast {
             log::warn!("Test behavior: dropping after contract exchange");
             let err = TakerError::General("Test: dropped after contract exchange".to_string());
@@ -3649,6 +3665,12 @@ pub enum TakerBehavior {
     DropAfterFundsBroadcast,
     /// Broadcast contract transactions after full setup, then close (malice scenario).
     BroadcastContractAfterFullSetup,
+    /// Broadcast contract transactions after full setup, then keep the swap
+    /// going instead of closing — the taker forces the incoming contract
+    /// on-chain while still talking to the maker, so the maker must catch it
+    /// itself instead of relying on a dropped-connection idle timeout
+    /// (maker breach-detection malice scenario).
+    BroadcastContractDuringSwap,
     /// Close connection after receiving AckSwapDetails (taproot taker abort).
     CloseAtAckResponse,
     /// Close connection when sending sender's contract data (taproot taker abort).
