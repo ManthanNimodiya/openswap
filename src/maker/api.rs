@@ -1225,9 +1225,15 @@ impl MakerServer {
     /// True if any funding outpoint in `incoming` has been spent by its own
     /// contract txid. Sentinels are polled through the watch service's own
     /// cache (armed by `process_proof_of_funding`), so this never makes a
-    /// fresh backend call; a watcher error is logged and read as not
-    /// breached — the idle timeout and refund deadline stay the fallback.
-    fn legacy_incoming_funding_breached(&self, incoming: &[IncomingSwapCoin]) -> bool {
+    /// fresh backend call. A watcher error is returned to the caller instead
+    /// of read as "not breached": the synchronous gates in
+    /// `legacy_swap_breached` must fail closed on it, and only
+    /// `drain_breached_swaps`'s background loop — which gets another try
+    /// next heartbeat — chooses to log and continue.
+    fn legacy_incoming_funding_breached(
+        &self,
+        incoming: &[IncomingSwapCoin],
+    ) -> Result<bool, MakerError> {
         for sc in incoming {
             let Some(funding_input) = sc.contract_tx.input.first() else {
                 continue;
@@ -1240,18 +1246,20 @@ impl MakerServer {
                 Ok(crate::watch_tower::watcher::WatcherEvent::UtxoSpent {
                     spending_tx: Some(tx),
                     ..
-                }) if tx.compute_txid() == expected_txid => return true,
+                }) if tx.compute_txid() == expected_txid => return Ok(true),
                 Ok(_) => {}
                 Err(e) => {
-                    log::error!(
-                        "[{}] breach watch query for {} failed: {e}",
-                        self.config.network_port,
-                        funding_input.previous_output
-                    );
+                    return Err(MakerError::General(
+                        format!(
+                            "breach watch query for {} failed: {e}",
+                            funding_input.previous_output
+                        )
+                        .leak(),
+                    ));
                 }
             }
         }
-        false
+        Ok(false)
     }
 
     /// Removes and returns swap data for any Legacy swap whose incoming
@@ -1278,13 +1286,24 @@ impl MakerServer {
 
         let mut breached_ids = Vec::new();
         for (id, incoming) in &candidates {
-            if self.legacy_incoming_funding_breached(incoming) {
-                log::error!(
-                    "[{}] Swap {} breached: incoming funding outpoint spent by its own contract tx before the swap finished. Recovering now.",
+            match self.legacy_incoming_funding_breached(incoming) {
+                Ok(true) => {
+                    log::error!(
+                        "[{}] Swap {} breached: incoming funding outpoint spent by its own contract tx before the swap finished. Recovering now.",
+                        self.config.network_port,
+                        id
+                    );
+                    breached_ids.push(id.clone());
+                }
+                Ok(false) => {}
+                // A watcher hiccup on one swap must not stall the drain for
+                // every other swap; this candidate just gets another try on
+                // the next heartbeat.
+                Err(e) => log::error!(
+                    "[{}] breach scan for swap {} failed, will retry next heartbeat: {e:?}",
                     self.config.network_port,
                     id
-                );
-                breached_ids.push(id.clone());
+                ),
             }
         }
 
@@ -1964,7 +1983,7 @@ impl MakerTrait for MakerServer {
                 None => return Ok(false),
             }
         };
-        Ok(self.legacy_incoming_funding_breached(&incoming))
+        self.legacy_incoming_funding_breached(&incoming)
     }
 
     fn sync_and_save_wallet(&self) -> Result<(), MakerError> {

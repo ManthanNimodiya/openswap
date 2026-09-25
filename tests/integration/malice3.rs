@@ -107,6 +107,16 @@ fn test_malice3_maker_detects_legacy_breach_during_swap() {
         "the breach must be caught on its own path, not read as a dropped connection"
     );
 
+    // The behavior this test actually exists to prove: Maker1 must have
+    // refused the private key handover, not merely logged the breach and
+    // handed the key over anyway. `wait_for_log` above only proves the
+    // heartbeat drain ran; this proves the synchronous gate fired too.
+    assert!(
+        log_contents.contains("Aborting swap")
+            && log_contents.contains("before private key handover"),
+        "Maker1 must refuse the private key handover once breached, found no matching log line"
+    );
+
     // Sleep budget: 30s idle timeout (test builds) + 225-block outer-hop
     // timelock (REFUND_LOCKTIME_BASE 150 + STEP 75, 2 makers) ≈ 135s at
     // 5 blocks/3s; remaining is scheduling margin, matching malice1.

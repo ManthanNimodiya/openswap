@@ -1418,10 +1418,15 @@ impl Taker {
             // Same adversarial broadcast as `BroadcastContractAfterFullSetup`,
             // but the connection stays open and the swap keeps going: the
             // maker must catch this on its own, not rely on the taker
-            // dropping the connection.
+            // dropping the connection. `outgoing.contract_tx` carries no
+            // witness by itself — sign it first, or the broadcast is rejected
+            // and the maker never sees anything to detect.
             let wallet = self.read_wallet()?;
             for outgoing in &self.swap_state()?.outgoing_swapcoins {
-                let _ = wallet.send_tx(&outgoing.contract_tx);
+                let signed_tx = outgoing
+                    .create_signed_contract_tx()
+                    .map_err(TakerError::Wallet)?;
+                wallet.send_tx(&signed_tx).map_err(TakerError::Wallet)?;
             }
             drop(wallet);
         }

@@ -699,6 +699,25 @@ fn handle_connection(
                         );
                     }
                 }
+
+                // The breach sentinel on each incoming funding outpoint,
+                // registered by `process_proof_of_funding`, is a separate
+                // watch from the contract-output ones above and needs its own
+                // cleanup, or it stays registered until process shutdown.
+                for swapcoin in &state.incoming_swapcoins {
+                    let (Some(funding_input), Some(multisig_redeemscript)) = (
+                        swapcoin.contract_tx.input.first(),
+                        swapcoin.multisig_redeemscript.as_ref(),
+                    ) else {
+                        continue;
+                    };
+                    let Ok(funding_spk) =
+                        crate::utill::redeemscript_to_scriptpubkey(multisig_redeemscript)
+                    else {
+                        continue;
+                    };
+                    maker.unwatch_outpoint(funding_input.previous_output, funding_spk);
+                }
             }
 
             break;
