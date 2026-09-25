@@ -932,15 +932,22 @@ impl Wallet {
             if !unspent {
                 all_unspent = false;
             }
-            if let Ok(parent_tx) = chain.get_raw_transaction(&outpoint.txid, None) {
-                if parent_tx.compute_txid() == outpoint.txid {
-                    if let Some(output) = parent_tx.output.get(outpoint.vout as usize) {
-                        if chain.is_confirmed_spend(&outpoint, &output.script_pubkey)? {
-                            any_confirmed_spent = true;
-                            break;
+            match chain.get_raw_transaction(&outpoint.txid, None) {
+                Ok(parent_tx) => {
+                    if parent_tx.compute_txid() == outpoint.txid {
+                        if let Some(output) = parent_tx.output.get(outpoint.vout as usize) {
+                            if chain.is_confirmed_spend(&outpoint, &output.script_pubkey)? {
+                                any_confirmed_spent = true;
+                                break;
+                            }
                         }
                     }
                 }
+                // A genuinely absent parent has nothing to check. Any other
+                // failure — transport, protocol, a txid-mismatch guard — must
+                // reach the caller, not read as "input not confirmed spent".
+                Err(_) if chain.is_tx_unknown(&outpoint.txid)? => {}
+                Err(e) => return Err(e),
             }
         }
 
@@ -1044,7 +1051,16 @@ impl Wallet {
                     }
                 } else if let Some(input) = swapcoin.contract_tx.input.first() {
                     let input_outpoint = input.previous_output;
-                    if let Ok(parent_tx) = chain.get_raw_transaction(&input_outpoint.txid, None) {
+                    let parent_tx = match chain.get_raw_transaction(&input_outpoint.txid, None) {
+                        Ok(tx) => Some(tx),
+                        // A genuinely absent parent has nothing to check here.
+                        // Any other failure — transport, protocol, a
+                        // txid-mismatch guard — must reach the caller, not
+                        // read as "nothing learned about this input".
+                        Err(_) if chain.is_tx_unknown(&input_outpoint.txid)? => None,
+                        Err(e) => return Err(e),
+                    };
+                    if let Some(parent_tx) = parent_tx {
                         if parent_tx.compute_txid() == input_outpoint.txid {
                             if let Some(output) = parent_tx.output.get(input_outpoint.vout as usize)
                             {
@@ -5537,9 +5553,18 @@ mod legacy_recovery_tests {
                 let res =
                     Wallet::ensure_contract_on_chain(&blockchain, "swap-mismatched", &sc, &|_| {
                         false
-                    })
-                    .unwrap();
-                assert_eq!(res, ContractChainState::NotYet);
+                    });
+                // Electrum validates the returned txid and rejects the
+                // mismatch; that failure must reach the caller, not read as
+                // "nothing to check, keep waiting". Core's stub has no such
+                // guard and returns the wrong transaction transparently, so
+                // the mismatch there is caught downstream by the plain txid
+                // comparison instead, and normal NotYet still applies.
+                if matches!(blockchain, AnyBlockchain::Electrum(_)) {
+                    res.unwrap_err();
+                } else {
+                    assert_eq!(res.unwrap(), ContractChainState::NotYet);
+                }
             },
         );
     }
@@ -5621,9 +5646,17 @@ mod legacy_recovery_tests {
                     "swap-no-funding-mismatched",
                     &sc,
                     &|_| false,
-                )
-                .unwrap();
-                assert_eq!(res, ContractChainState::NotYet);
+                );
+                // Same split as the funded-mismatch case: Electrum's
+                // txid-validating fetch rejects the wrong transaction and
+                // that must propagate, while Core's stub returns it
+                // transparently and the plain txid comparison downstream
+                // catches the mismatch, leaving NotYet.
+                if matches!(blockchain, AnyBlockchain::Electrum(_)) {
+                    res.unwrap_err();
+                } else {
+                    assert_eq!(res.unwrap(), ContractChainState::NotYet);
+                }
             },
         );
     }
