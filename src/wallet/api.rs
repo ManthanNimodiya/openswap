@@ -894,6 +894,37 @@ impl Wallet {
             .collect()
     }
 
+    fn check_funding_inputs_state(
+        chain: &AnyBlockchain,
+        tx: &Transaction,
+    ) -> Result<(bool, bool), WalletError> {
+        let mut any_confirmed_spent = false;
+        let mut all_unspent = !tx.input.is_empty();
+
+        for input in &tx.input {
+            let outpoint = input.previous_output;
+            let unspent = matches!(
+                chain.get_tx_out(&outpoint.txid, outpoint.vout, Some(true)),
+                Ok(Some(_))
+            );
+            if !unspent {
+                all_unspent = false;
+            }
+            if let Ok(parent_tx) = chain.get_raw_transaction(&outpoint.txid, None) {
+                if parent_tx.compute_txid() == outpoint.txid {
+                    if let Some(output) = parent_tx.output.get(outpoint.vout as usize) {
+                        if chain.is_confirmed_spend(&outpoint, &output.script_pubkey)? {
+                            any_confirmed_spent = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok((any_confirmed_spent, all_unspent))
+    }
+
     /// Ensure a swapcoin's contract tx is on-chain, broadcasting it when needed.
     ///
     /// Every answer comes from a chain query, never from parsing backend error
@@ -937,15 +968,17 @@ impl Wallet {
         // if its wallet input is still unspent, the tx was never broadcast
         // and the funds never left.
         let input_outpoint = swapcoin.contract_tx.input[0].previous_output;
-        let input_unspent = chain
-            .get_tx_out(&input_outpoint.txid, input_outpoint.vout, Some(true))?
-            .is_some();
-        if input_unspent && swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot {
-            log::info!(
-                "Contract tx for {} was never broadcast — wallet UTXOs still unspent, discarding swapcoin",
-                swap_id
-            );
-            return Ok(ContractChainState::Discarded);
+        if swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot {
+            let input_unspent = chain
+                .get_tx_out(&input_outpoint.txid, input_outpoint.vout, Some(true))?
+                .is_some();
+            if input_unspent {
+                log::info!(
+                    "Contract tx for {} was never broadcast — wallet UTXOs still unspent, discarding swapcoin",
+                    swap_id
+                );
+                return Ok(ContractChainState::Discarded);
+            }
         }
 
         // Legacy: the contract tx is pre-signed insurance that may never have
@@ -954,35 +987,34 @@ impl Wallet {
             Ok(tx) => tx,
             Err(e) => {
                 // If the contract tx cannot be signed (e.g. missing maker's signature),
-                // check if the swapcoin can be safely discarded because the funding
-                // transaction can never confirm due to its inputs being confirmed spent.
+                // check if the swapcoin can be safely discarded:
+                // 1. Funding transaction inputs were confirmed spent elsewhere, so funding
+                //    can never confirm.
+                // 2. Funding transaction is unknown to the mempool/chain, all its wallet
+                //    inputs are still unspent, and it was never shared with the peer.
                 if let Some(ref funding_tx) = swapcoin.funding_tx {
                     let funding_txid = funding_tx.compute_txid();
                     let funding_confirmed = chain.tx_block_height(&funding_txid)?.is_some();
 
                     if !funding_confirmed {
-                        let mut any_input_confirmed_spent = false;
-                        for input in &funding_tx.input {
-                            let outpoint = input.previous_output;
-                            if let Ok(parent_tx) = chain.get_raw_transaction(&outpoint.txid, None) {
-                                if parent_tx.compute_txid() == outpoint.txid {
-                                    if let Some(output) =
-                                        parent_tx.output.get(outpoint.vout as usize)
-                                    {
-                                        if chain
-                                            .is_confirmed_spend(&outpoint, &output.script_pubkey)?
-                                        {
-                                            any_input_confirmed_spent = true;
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                        let (any_confirmed_spent, all_unspent) =
+                            Self::check_funding_inputs_state(chain, funding_tx)?;
 
-                        if any_input_confirmed_spent {
+                        if any_confirmed_spent {
                             log::info!(
                                 "Contract tx for {} cannot be signed and funding tx inputs were spent — discarding swapcoin",
+                                swap_id
+                            );
+                            return Ok(ContractChainState::Discarded);
+                        }
+
+                        let funding_unknown = chain.is_tx_unknown(&funding_txid)?;
+                        if funding_unknown
+                            && all_unspent
+                            && !funding_shared_with_peer(swapcoin.swap_id.as_deref())
+                        {
+                            log::info!(
+                                "Contract tx for {} cannot be signed, funding tx is unknown, wallet inputs are unspent, and funding was never shared — discarding swapcoin",
                                 swap_id
                             );
                             return Ok(ContractChainState::Discarded);
@@ -1000,6 +1032,33 @@ impl Wallet {
                                     log::info!(
                                         "Contract tx for {} cannot be signed and input outpoint was confirmed spent — discarding swapcoin",
                                         swap_id,
+                                    );
+                                    return Ok(ContractChainState::Discarded);
+                                }
+                            }
+
+                            let parent_confirmed =
+                                chain.tx_block_height(&input_outpoint.txid)?.is_some();
+                            if !parent_confirmed {
+                                let (any_confirmed_spent, all_unspent) =
+                                    Self::check_funding_inputs_state(chain, &parent_tx)?;
+
+                                if any_confirmed_spent {
+                                    log::info!(
+                                        "Contract tx for {} cannot be signed and parent tx inputs were spent — discarding swapcoin",
+                                        swap_id
+                                    );
+                                    return Ok(ContractChainState::Discarded);
+                                }
+
+                                let parent_unknown = chain.is_tx_unknown(&input_outpoint.txid)?;
+                                if parent_unknown
+                                    && all_unspent
+                                    && !funding_shared_with_peer(swapcoin.swap_id.as_deref())
+                                {
+                                    log::info!(
+                                        "Contract tx for {} cannot be signed, parent tx is unknown, wallet inputs are unspent, and funding was never shared — discarding swapcoin",
+                                        swap_id
                                     );
                                     return Ok(ContractChainState::Discarded);
                                 }
@@ -4855,7 +4914,16 @@ mod legacy_recovery_tests {
                                             "ancestorcount": 1,
                                             "ancestorsize": 100,
                                             "wtxid": tx.compute_wtxid().to_string(),
-                                            "fees": {"base": 0.00001}
+                                            "fees": {
+                                                "base": 0.00001,
+                                                "modified": 0.00001,
+                                                "ancestor": 0.00001,
+                                                "descendant": 0.00001
+                                            },
+                                            "depends": [],
+                                            "spentby": [],
+                                            "bip125-replaceable": true,
+                                            "unbroadcast": false
                                         });
                                         (
                                             200,
@@ -5179,7 +5247,8 @@ mod legacy_recovery_tests {
     }
 
     #[test]
-    fn test_ensure_contract_unsigned_legacy_with_unspent_wallet_inputs_is_not_yet() {
+    fn test_ensure_contract_unsigned_legacy_with_unspent_wallet_inputs_and_unshared_funding_is_discarded(
+    ) {
         let parent_tx = Transaction {
             version: bitcoin::transaction::Version::TWO,
             lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
@@ -5211,6 +5280,46 @@ mod legacy_recovery_tests {
             let res =
                 Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent", &sc, &|_| false)
                     .unwrap();
+            assert_eq!(res, ContractChainState::Discarded);
+        });
+    }
+
+    #[test]
+    fn test_ensure_contract_unsigned_legacy_with_unspent_wallet_inputs_and_shared_funding_is_not_yet(
+    ) {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let parent_txid = parent_tx.compute_txid();
+
+        let funding_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
+        for_both_backends(vec![(parent_tx, Some(10), true)], |blockchain| {
+            let res =
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-unspent-shared", &sc, &|_| {
+                    true
+                })
+                .unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
@@ -5469,6 +5578,34 @@ mod legacy_recovery_tests {
                 )
                 .unwrap();
                 assert_eq!(res, ContractChainState::NotYet);
+            },
+        );
+    }
+
+    #[test]
+    fn test_electrum_tx_block_height_rejects_mismatched_txid() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let mismatched_txid = Txid::from_byte_array([99u8; 32]);
+
+        for_both_backends_with_aliases(
+            vec![(parent_tx.clone(), Some(10), true)],
+            vec![(mismatched_txid, parent_tx)],
+            |blockchain| {
+                if let AnyBlockchain::Electrum(ref electrum) = blockchain {
+                    let res = electrum.tx_block_height(&mismatched_txid);
+                    assert!(
+                        res.is_err(),
+                        "Electrum::tx_block_height must reject txid mismatch"
+                    );
+                }
             },
         );
     }
