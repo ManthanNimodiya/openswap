@@ -684,8 +684,8 @@ impl Taker {
 
         // The watcher starts empty, so re-arm every contract still live in the
         // wallet. Without this a restart leaves them undefended.
-        let mut watches = wallet.incoming_contract_outpoints();
-        watches.extend(wallet.outgoing_contract_outpoints());
+        let mut watches = wallet.incoming_contract_outpoints(None);
+        watches.extend(wallet.outgoing_contract_outpoints(None));
         watches.extend(wallet.watchonly_contract_outpoints());
         if let Err(e) = watch_service.rebuild_watches(watches) {
             log::error!("could not rebuild watches on startup: {e}; recovery remains active");
@@ -738,6 +738,18 @@ impl Taker {
     fn init_recover_wallet(&mut self) {
         log::info!("Checking wallet for unresolved swap contracts...");
 
+        let (swap_ids, incoming_contract_txids) = match lock_debug!(self.swap_tracker.lock()) {
+            Ok(tracker) => tracker.recovery_scope(),
+            Err(_) => {
+                log::warn!("Startup recovery: swap tracker lock poisoned");
+                return;
+            }
+        };
+        if swap_ids.is_empty() {
+            log::info!("startup recovery: Not needed, no failed swaps");
+            return;
+        }
+
         // One connection serves both startup recovery passes; the sweep and
         // timelock recovery each take the lock themselves and drop it across
         // their waits, so a stuck counterparty tx cannot wedge taker startup.
@@ -760,7 +772,7 @@ impl Taker {
                 &self.wallet,
                 chain,
                 &crate::utill::NO_SHUTDOWN,
-                None,
+                Some(&incoming_contract_txids),
             ) {
                 Ok(ref swept) if !swept.is_empty() => {
                     log::info!(
@@ -778,7 +790,7 @@ impl Taker {
                 chain,
                 MIN_RELAY_FEE_RATE,
                 &crate::utill::NO_SHUTDOWN,
-                None,
+                Some(&swap_ids),
                 &|coin_swap| funding_shared(&self.swap_tracker, coin_swap),
             ) {
                 Ok(ref recovered) if !recovered.is_empty() => {
@@ -792,10 +804,14 @@ impl Taker {
             }
         }
 
-        let has_remaining = match self.write_wallet() {
+        let has_remaining = match self.read_wallet() {
             Ok(wallet) => {
-                !wallet.outgoing_contract_outpoints().is_empty()
-                    || !wallet.incoming_contract_outpoints().is_empty()
+                !wallet
+                    .outgoing_contract_outpoints(Some(&swap_ids))
+                    .is_empty()
+                    || !wallet
+                        .incoming_contract_outpoints(Some(&swap_ids))
+                        .is_empty()
             }
             Err(e) => {
                 log::warn!("Startup recovery: failed to lock wallet: {:?}", e);
@@ -817,12 +833,7 @@ impl Taker {
                     return;
                 }
             };
-            match RecoveryLoop::start(
-                self.wallet.clone(),
-                self.swap_tracker.clone(),
-                data_dir,
-                None,
-            ) {
+            match RecoveryLoop::start(self.wallet.clone(), self.swap_tracker.clone(), data_dir) {
                 Ok(rl) => self.recovery_loop = Some(rl),
                 // Without the loop, remaining contracts are never swept.
                 Err(e) => log::error!("Failed to spawn recovery loop: {e}"),
@@ -1217,6 +1228,45 @@ impl Taker {
     /// Commits funds on-chain: creates funding transactions, exchanges
     /// contracts with makers, finalizes, and sweeps.
     pub fn start_swap(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
+        let result = self.start_swap_inner(swap_id);
+        if let Err(error) = &result {
+            if let Err(reconcile_error) = self.reconcile_start_failure(error) {
+                log::error!(
+                    "Failed to persist/recover swap after {:?}: {:?}",
+                    error,
+                    reconcile_error
+                );
+            }
+        }
+        result
+    }
+
+    /// Reconcile any error that escaped swap execution after funding may have
+    /// reached the network. This boundary covers failures from sweep, wallet
+    /// sync, cleanup, and other `?` exits as well as protocol errors.
+    fn reconcile_start_failure(&mut self, error: &TakerError) -> Result<(), TakerError> {
+        let failed_at = match self.ongoing_swap.as_ref() {
+            Some(swap)
+                if matches!(
+                    swap.phase,
+                    SwapPhase::FundsBroadcast
+                        | SwapPhase::ContractsExchanged
+                        | SwapPhase::Finalizing
+                        | SwapPhase::PrivkeysForwarded
+                ) =>
+            {
+                swap.phase
+            }
+            _ => return Ok(()),
+        };
+
+        // Recovery must not depend on this save: the tracker is updated in memory
+        let persisted = self.persist_failure(failed_at, error);
+        let recovered = self.recover_active_swap();
+        persisted.and(recovered)
+    }
+
+    fn start_swap_inner(&mut self, swap_id: &str) -> Result<TakerReport, TakerError> {
         let swap_start_time = Instant::now();
 
         // Verify the swap_id matches the prepared swap.
@@ -1274,10 +1324,7 @@ impl Taker {
                         .map(|s| s.payment.is_some())
                         .unwrap_or(false);
                     if !payment_swap && self.no_outgoing_funding_on_chain() {
-                        if let Some(spare) = {
-                            let swap = self.swap_state_mut()?;
-                            swap.spare_makers.pop()
-                        } {
+                        if let Some(spare) = self.take_eligible_spare()? {
                             log::warn!(
                                 "Pre-funding exchange failure, substituting maker 0 with spare"
                             );
@@ -1302,18 +1349,10 @@ impl Taker {
                     Err(e) => {
                         log::error!("Legacy contract exchange failed: {:?}", e);
                         self.emit_failure_report(&initial_utxos, swap_start_time, &e);
-                        let phase = self
-                            .swap_state()
-                            .map(|s| s.phase)
-                            .unwrap_or(SwapPhase::MakersDiscovered);
                         // Clean up only while the broadcast loop was never
                         // entered; past it the swap goes to recovery.
                         if !self.no_outgoing_funding_on_chain() {
                             log::warn!("Funding txs were broadcast, triggering recovery");
-                            self.persist_failure(phase, &e);
-                            if let Err(re) = self.recover_active_swap() {
-                                log::error!("Recovery failed: {:?}", re);
-                            }
                         } else {
                             log::info!("No funds on-chain — safe to abort");
                             let _ = lock_debug!(self.swap_tracker.lock())
@@ -1334,19 +1373,11 @@ impl Taker {
                 Err(e) => {
                     log::error!("Taproot exchange failed: {:?}", e);
                     self.emit_failure_report(&initial_utxos, swap_start_time, &e);
-                    let phase = self
-                        .swap_state()
-                        .map(|s| s.phase)
-                        .unwrap_or(SwapPhase::MakersDiscovered);
                     // Same predicate as Legacy: clean up only while the
                     // broadcast loop was never entered; a swap_state failure
                     // reads as uncertain, so fail toward recovery.
                     if !self.no_outgoing_funding_on_chain() {
                         log::warn!("Funds were broadcast, triggering recovery");
-                        self.persist_failure(phase, &e);
-                        if let Err(re) = self.recover_active_swap() {
-                            log::error!("Recovery failed: {:?}", re);
-                        }
                     } else {
                         log::info!("No funds on-chain — safe to abort");
                         let _ = lock_debug!(self.swap_tracker.lock())
@@ -1375,22 +1406,14 @@ impl Taker {
                 .map(|s| s.phase)
                 .unwrap_or(SwapPhase::FundsBroadcast);
             let err = TakerError::General("Test: broadcast contract after full setup".to_string());
-            self.persist_failure(phase, &err);
+            self.persist_failure(phase, &err)?;
             return Err(err);
         }
 
         #[cfg(feature = "integration-test")]
         if self.behavior == TakerBehavior::DropAfterFundsBroadcast {
             log::warn!("Test behavior: dropping after contract exchange");
-            let phase = self
-                .swap_state()
-                .map(|s| s.phase)
-                .unwrap_or(SwapPhase::FundsBroadcast);
             let err = TakerError::General("Test: dropped after contract exchange".to_string());
-            self.persist_failure(phase, &err);
-            if let Err(re) = self.recover_active_swap() {
-                log::error!("Recovery failed: {:?}", re);
-            }
             return Err(err);
         }
 
@@ -1400,7 +1423,7 @@ impl Taker {
         if self.behavior == TakerBehavior::CrashAfterContractExchange {
             log::warn!("Test behavior: crashing after contract exchange");
             let err = TakerError::General("Test: crashed after contract exchange".to_string());
-            self.persist_failure(SwapPhase::ContractsExchanged, &err);
+            self.persist_failure(SwapPhase::ContractsExchanged, &err)?;
             return Err(err);
         }
 
@@ -1413,7 +1436,7 @@ impl Taker {
         if self.behavior == TakerBehavior::CrashBeforeRecovery {
             log::warn!("Test behavior: crashing before finalization");
             let err = TakerError::General("Test: crashed before finalization".to_string());
-            self.persist_failure(SwapPhase::Finalizing, &err);
+            self.persist_failure(SwapPhase::Finalizing, &err)?;
             return Err(err);
         }
 
@@ -1422,10 +1445,6 @@ impl Taker {
             Err(e) => {
                 log::error!("Finalization failed after retries: {:?}", e);
                 self.emit_failure_report(&initial_utxos, swap_start_time, &e);
-                self.persist_failure(SwapPhase::Finalizing, &e);
-                if let Err(re) = self.recover_active_swap() {
-                    log::error!("Recovery failed: {:?}", re);
-                }
                 return Err(e);
             }
         }
@@ -1464,10 +1483,6 @@ impl Taker {
                 expected_incoming_swapcoins
             ));
             self.emit_failure_report(&initial_utxos, swap_start_time, &err);
-            self.persist_failure(SwapPhase::Finalizing, &err);
-            if let Err(re) = self.recover_active_swap() {
-                log::error!("Recovery failed: {:?}", re);
-            }
             return Err(err);
         }
 
@@ -1526,9 +1541,22 @@ impl Taker {
                 })
                 .collect();
 
+            // A ban outlives the route it was earned on, so naming a maker by
+            // address does not get past it. An address we have never seen is
+            // not banned, and stays usable.
+            let mut allowed = Vec::with_capacity(parsed.len());
+            for address in parsed {
+                if self.offerbook.is_banned(&address)? {
+                    log::warn!("Skipping banned preferred maker {address}");
+                    continue;
+                }
+                allowed.push(address);
+            }
+            let parsed = allowed;
+
             if parsed.len() < maker_count {
                 return Err(TakerError::General(format!(
-                    "Not enough valid preferred makers. Required: {}, Parsed: {}",
+                    "Not enough usable preferred makers. Required: {}, usable: {} (unreadable or banned addresses are dropped)",
                     maker_count,
                     parsed.len()
                 )));
@@ -1755,7 +1783,7 @@ impl Taker {
                             i, e
                         )));
                     }
-                    let spare = self.swap_state_mut()?.spare_makers.pop();
+                    let spare = self.take_eligible_spare()?;
                     if let Some(spare_addr) = spare {
                         log::info!("Substituting maker {} with spare at {}", i, spare_addr);
                         let mut replacement = MakerConnection::new(spare_addr, protocol, None);
@@ -2098,27 +2126,9 @@ impl Taker {
         maker_idx: usize,
         send_amount: Amount,
     ) -> Result<(), TakerError> {
-        // Fee percentage sanity: must be finite and non-negative, and < 100%
-        if offer.amount_relative_fee_pct.is_nan()
-            || offer.amount_relative_fee_pct.is_infinite()
-            || offer.amount_relative_fee_pct < 0.0
-            || offer.amount_relative_fee_pct >= 100.0
-        {
-            return Err(TakerError::General(format!(
-                "Maker {} offer has invalid amount_relative_fee_pct: {}",
-                maker_idx, offer.amount_relative_fee_pct
-            )));
-        }
-        if offer.time_relative_fee_pct.is_nan()
-            || offer.time_relative_fee_pct.is_infinite()
-            || offer.time_relative_fee_pct < 0.0
-            || offer.time_relative_fee_pct >= 100.0
-        {
-            return Err(TakerError::General(format!(
-                "Maker {} offer has invalid time_relative_fee_pct: {}",
-                maker_idx, offer.time_relative_fee_pct
-            )));
-        }
+        offer
+            .validate_shape()
+            .map_err(|e| TakerError::General(format!("Maker {maker_idx} {e}")))?;
 
         // Base fee must not exceed the send amount (that would consume everything)
         if offer.base_fee > send_amount.to_sat() {
@@ -2127,14 +2137,6 @@ impl Taker {
                 maker_idx,
                 offer.base_fee,
                 send_amount.to_sat()
-            )));
-        }
-
-        // Size limits must be consistent
-        if offer.min_size > offer.max_size {
-            return Err(TakerError::General(format!(
-                "Maker {} offer has min_size ({}) > max_size ({})",
-                maker_idx, offer.min_size, offer.max_size
             )));
         }
 
@@ -2156,6 +2158,22 @@ impl Taker {
         Ok(())
     }
 
+    /// Next spare with no ban on record. A banned spare is dropped rather than
+    /// returned, so it cannot end the retry that would have used it.
+    pub(crate) fn take_eligible_spare(&mut self) -> Result<Option<MakerAddress>, TakerError> {
+        loop {
+            let spare = self.swap_state_mut()?.spare_makers.pop();
+            let Some(spare) = spare else {
+                return Ok(None);
+            };
+            if self.offerbook.is_banned(&spare)? {
+                log::warn!("Skipping banned spare maker {spare}");
+                continue;
+            }
+            return Ok(Some(spare));
+        }
+    }
+
     /// Put a spare in a failed maker's place and negotiate only with it.
     /// Downstream hops keep their admitted declarations, so the spare must
     /// derive the identical next hop or the swap aborts. The last hop has no
@@ -2170,6 +2188,14 @@ impl Taker {
             target_idx,
             spare_addr
         );
+
+        // Spares are picked at discovery and used much later, by which time one
+        // may have earned a ban.
+        if self.offerbook.is_banned(&spare_addr)? {
+            return Err(TakerError::General(format!(
+                "Spare maker {spare_addr} is banned"
+            )));
+        }
 
         // Payment routes are priced against the exact makers they were solved
         // for; substitution would invalidate the gross.
@@ -2666,10 +2692,20 @@ impl Taker {
             // maker from sending a garbage key that would make funds unspendable.
             if i == num_makers - 1 {
                 let secp = bitcoin::secp256k1::Secp256k1::new();
-                let incoming = &mut self.swap_state_mut()?.incoming_swapcoins;
-                for (incoming, received_privkey) in
-                    incoming.iter_mut().zip(received_privkeys.iter())
-                {
+                let incoming = &self.swap_state()?.incoming_swapcoins;
+                // `zip` stops at the shorter side, so a short reply would leave
+                // later swapcoins without the key that makes them spendable.
+                if received_privkeys.len() != incoming.len() {
+                    self.note_proven_violation(i);
+                    return Err(TakerError::General(format!(
+                        "Last maker {} sent {} private keys for {} incoming swapcoins",
+                        i,
+                        received_privkeys.len(),
+                        incoming.len()
+                    )));
+                }
+
+                for (incoming, received_privkey) in incoming.iter().zip(received_privkeys.iter()) {
                     let derived_pubkey = PublicKey {
                         compressed: true,
                         inner: bitcoin::secp256k1::PublicKey::from_secret_key(
@@ -2677,15 +2713,28 @@ impl Taker {
                             received_privkey,
                         ),
                     };
-                    if let Some(expected_pubkey) = incoming.other_pubkey {
-                        if derived_pubkey != expected_pubkey {
-                            return Err(TakerError::General(format!(
-                                "Last maker {} sent incorrect private key: derived pubkey {} \
-                                 does not match expected {}",
-                                i, derived_pubkey, expected_pubkey
-                            )));
-                        }
+                    // Without the expected key there is nothing to check against,
+                    // and an unchecked key can leave the coin unspendable.
+                    let Some(expected_pubkey) = incoming.other_pubkey else {
+                        return Err(TakerError::General(format!(
+                            "Incoming swapcoin has no expected pubkey to check maker {i}'s key"
+                        )));
+                    };
+                    if derived_pubkey != expected_pubkey {
+                        self.note_proven_violation(i);
+                        return Err(TakerError::General(format!(
+                            "Last maker {} sent incorrect private key: derived pubkey {} \
+                             does not match expected {}",
+                            i, derived_pubkey, expected_pubkey
+                        )));
                     }
+                }
+                for (incoming, received_privkey) in self
+                    .swap_state_mut()?
+                    .incoming_swapcoins
+                    .iter_mut()
+                    .zip(received_privkeys.iter())
+                {
                     incoming.set_other_privkey(*received_privkey);
                 }
                 log::info!(
@@ -2717,6 +2766,8 @@ impl Taker {
             incoming.len(),
             wallet.get_incoming_swapcoins_count()
         );
+        drop(wallet);
+        self.persist_progress()?;
         Ok(())
     }
 
@@ -2847,30 +2898,29 @@ impl Taker {
     }
 
     /// Persist a swap failure (SP-ERR) with the phase at which failure occurred.
-    fn persist_failure(&mut self, failed_at: SwapPhase, error: &TakerError) {
-        if let Ok(swap) = self.swap_state() {
-            let swap_id = swap.id.clone();
-            if let Ok(mut record) = self.persist_build_record(swap) {
-                record.phase = SwapPhase::Failed;
-                record.failed_at_phase = Some(failed_at);
-                record.failure_reason = Some(format!("{:?}", error));
-                record.updated_at = now_secs();
-                // The failure was already reported to the caller; a poisoned
-                // tracker here is no reason to panic.
-                let Ok(mut tracker) = lock_debug!(self.swap_tracker.lock()) else {
-                    log::error!("swap tracker lock poisoned; skipping failure persist");
-                    return;
-                };
-                // Preserve existing recovery state if resuming
-                if let Some(existing) = tracker.get_record(&swap_id) {
-                    record.recovery = existing.recovery.clone();
-                    record.created_at = existing.created_at;
-                }
-                if let Err(e) = tracker.save_record(&record) {
-                    log::error!("Failed to persist swap failure: {:?}", e);
-                }
-            }
+    fn persist_failure(
+        &mut self,
+        failed_at: SwapPhase,
+        error: &TakerError,
+    ) -> Result<(), TakerError> {
+        let swap = self.swap_state()?;
+        let swap_id = swap.id.clone();
+        let mut record = self.persist_build_record(swap)?;
+        record.phase = SwapPhase::Failed;
+        record.failed_at_phase = Some(failed_at);
+        record.failure_reason = Some(format!("{:?}", error));
+        record.updated_at = now_secs();
+
+        let mut tracker = lock_debug!(self.swap_tracker.lock())
+            .map_err(|_| TakerError::General("swap tracker lock poisoned".into()))?;
+        if let Some(existing) = tracker.get_record(&swap_id) {
+            record.recovery = existing.recovery.clone();
+            record.created_at = existing.created_at;
         }
+        tracker.save_record(&record)?;
+        drop(tracker);
+        self.swap_state_mut()?.phase = SwapPhase::Failed;
+        Ok(())
     }
 
     /// Print the swap report and save it beside the wallet file: UTXO diffs,
@@ -3298,6 +3348,9 @@ impl Taker {
         );
         self.ongoing_swap = None;
 
+        if let Some(recovery) = self.recovery_loop.take() {
+            drop(recovery);
+        }
         log::info!("Spawning recovery loop for swap {}", swap_id);
         let data_dir = self
             .config
@@ -3309,7 +3362,6 @@ impl Taker {
             self.wallet.clone(),
             self.swap_tracker.clone(),
             data_dir,
-            Some(swap_id),
         )?);
 
         Ok(())

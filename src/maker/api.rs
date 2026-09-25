@@ -695,8 +695,8 @@ impl MakerServer {
         // wallet. Without this a restart leaves them undefended. A failed
         // rescan retries inside the watcher, so an Err here means the watcher
         // is gone and the server will start in recovery-only mode.
-        let mut watches = wallet.incoming_contract_outpoints();
-        watches.extend(wallet.outgoing_contract_outpoints());
+        let mut watches = wallet.incoming_contract_outpoints(None);
+        watches.extend(wallet.outgoing_contract_outpoints(None));
         if let Err(e) = watch_service.rebuild_watches(watches) {
             log::error!("could not initialize watches on startup: {e}; recovery-only mode");
         }
@@ -825,13 +825,15 @@ impl MakerServer {
                 // The bond tx may never confirm (e.g. evicted again at a low
                 // feerate). Losing it must not take the maker down: log it,
                 // skip it, and let the next restart retry.
-                Err(WalletError::TxConfirmationTimeout(msg)) => {
+                Err(
+                    e @ (WalletError::TxConfirmationTimeout(_) | WalletError::TxNeverBroadcast(_)),
+                ) => {
                     log::error!(
                         "[{}] Pending fidelity bond {} did not confirm ({}); \
                          skipping it and continuing startup.",
                         self.config.network_port,
                         txid,
-                        msg
+                        e
                     );
                     continue;
                 }
@@ -951,12 +953,9 @@ impl MakerServer {
             );
 
             // Wait for funds and create fidelity bond
-            let sleep_increment = 10;
-            let mut sleep_multiplier = 0;
+            const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
             while !self.shutdown.load(Ordering::Relaxed) {
-                sleep_multiplier += 1;
-
                 log::info!("Sync at:----setup_fidelity_bond----");
                 lock_debug!(self.wallet.write())
                     .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -993,9 +992,8 @@ impl MakerServer {
                                 addr
                             );
 
-                            let total_sleep = sleep_increment * sleep_multiplier.min(60);
-                            log::info!("Next sync in {total_sleep:?} secs");
-                            if !self.wait_for_shutdown(Duration::from_secs(total_sleep)) {
+                            log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
+                            if !self.wait_for_shutdown(SYNC_INTERVAL) {
                                 return Err(MakerError::General("Shutdown requested"));
                             }
                         } else {
@@ -1054,8 +1052,7 @@ impl MakerServer {
 
     /// Check if maker has enough liquidity for swaps.
     pub fn check_swap_liquidity(&self) -> Result<(), MakerError> {
-        let sleep_increment = 10u64;
-        let mut sleep_duration = 0u64;
+        const SYNC_INTERVAL: Duration = Duration::from_secs(10);
 
         let addr = lock_debug!(self.wallet.write())
             .map_err(|_| MakerError::General("Failed to lock wallet"))?
@@ -1081,9 +1078,8 @@ impl MakerServer {
                     "Low Swap Liquidity | Min: {min_required} sats | Available: {offer_max_size} sats. Add funds to {addr:?}"
                 );
 
-                sleep_duration = (sleep_duration + sleep_increment).min(600);
-                log::info!("Next sync in {sleep_duration:?} secs");
-                if !self.wait_for_shutdown(Duration::from_secs(sleep_duration)) {
+                log::info!("Next sync in {} secs", SYNC_INTERVAL.as_secs());
+                if !self.wait_for_shutdown(SYNC_INTERVAL) {
                     break;
                 }
             } else {
@@ -1802,7 +1798,7 @@ impl MakerTrait for MakerServer {
             return Ok(false);
         }
         Ok(wallet
-            .outgoing_contract_outpoints()
+            .outgoing_contract_outpoints(None)
             .into_iter()
             .any(|(outpoint, _)| outpoint.txid == *txid))
     }

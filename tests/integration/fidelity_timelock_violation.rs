@@ -1,6 +1,6 @@
 //! This test demonstrates the scenario when the Maker violates the accepted fidelity_timelock limit.
-//! During offerbook sync, the taker discovers this during offerbook sync and rejects maker's offer
-//! leading to `NotEnoughMakersInOfferBook` error.
+//! Discovery drops the bond announcement outright, so the swap fails with
+//! `NotEnoughMakersInOfferBook`, and a direct poll of that maker sidelines it.
 //! Later we restart the Maker with faulty config that is setting the fidelity_timelock to an
 //! unacceptable block count, the Maker thus results an error saying "Invalid fidelity timelock".
 
@@ -8,7 +8,10 @@ use bitcoin::Amount;
 use openswap::{
     maker::{start_server, MakerBehavior, MakerError, MakerServer, MakerServerConfig},
     protocol::common_messages::ProtocolVersion,
-    taker::{error::TakerError, SwapParams, TakerBehavior},
+    taker::{
+        error::TakerError, MakerState, SwapParams, TakerBehavior, UnavailableReason,
+        UnavailableState,
+    },
     wallet::WalletError,
 };
 
@@ -23,13 +26,13 @@ fn fidelity_limit_violation() {
     warn!("Running Test: Fidelity Timelock violation");
 
     // Create a maker with InvalidFidelityTimelock behavior
-    let makers_config_map = vec![(8302, None)];
+    let maker_count = 1;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::InvalidFidelityTimelock];
 
     // Initialize test framework
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -79,6 +82,36 @@ fn fidelity_limit_violation() {
         err
     );
     info!("OpenSwap failed as expected: {err:?}");
+
+    // Discovery drops an out-of-range bond before the offerbook ever sees it,
+    // so reach the maker the way a user would: poll it by address.
+    let address = format!("127.0.0.1:{}", maker.config.network_port);
+    assert!(
+        taker
+            .fetch_offers()
+            .unwrap()
+            .all_makers()
+            .iter()
+            .all(|m| m.address.to_string() != address),
+        "discovery must not admit a maker whose bond timelock is out of range"
+    );
+
+    // The range is measured from our own confirmation height, which an honest
+    // bond can miss by confirming late, so it sidelines rather than bans.
+    let standing = taker
+        .poll_maker(address)
+        .expect("the poll must be recorded");
+    assert!(
+        matches!(
+            standing.state,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::BondUnverified,
+                ..
+            })
+        ),
+        "an out-of-range bond timelock must sideline the maker, got {:?}",
+        standing.state
+    );
 
     info!("Shutting down maker to simulate restart with corrupted config");
     maker.shutdown.store(true, Relaxed);

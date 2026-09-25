@@ -1,6 +1,7 @@
 //! OpenSwap Maker Server.
 
 use std::{
+    collections::HashSet,
     io::{ErrorKind, Read},
     net::{Ipv4Addr, TcpListener, TcpStream},
     sync::{
@@ -821,6 +822,16 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
         }
         elapsed = Duration::ZERO;
 
+        // Runs ahead of the swap gate: a long swap must not leave us advertising
+        // a height our own chain has already moved.
+        if let Err(e) = refresh_fidelity_conf_heights(&maker) {
+            log::warn!(
+                "[{}] Could not refresh fidelity bond heights: {:?}",
+                maker.config.network_port,
+                e
+            );
+        }
+
         // Skip renewal check if a swap is in progress
         if maker.has_ongoing_swaps()? {
             continue;
@@ -852,6 +863,63 @@ fn fidelity_renewal_loop(maker: Arc<MakerServer>, maker_address: &str) -> Result
                 e
             );
         }
+    }
+
+    Ok(())
+}
+
+/// Corrects the advertised confirmation height of every unspent bond after a
+/// reorg remines it. The height is not covered by the bond certificate, so
+/// nothing else would ever notice it had gone stale.
+fn refresh_fidelity_conf_heights(maker: &Arc<MakerServer>) -> Result<(), MakerError> {
+    let bonds: Vec<(u32, bitcoin::Txid, u32)> = lock_debug!(maker.wallet.read())
+        .map_err(|_| MakerError::General("Failed to lock wallet"))?
+        .store
+        .fidelity_bond
+        .iter()
+        .filter(|bond| !bond.is_spent)
+        .filter_map(|bond| {
+            bond.conf_height
+                .map(|height| (bond.bond_index, bond.outpoint.txid, height))
+        })
+        .collect();
+    if bonds.is_empty() {
+        return Ok(());
+    }
+
+    // A fresh connection keeps the wallet lock off the backend round trips.
+    let chain = lock_debug!(maker.wallet.read())
+        .map_err(|_| MakerError::General("Failed to lock wallet"))?
+        .blockchain
+        .new_connection()?;
+
+    for (index, txid, stored) in bonds {
+        // No height at all means a reorg deeper than this network allows, which
+        // this cannot repair; leave the bond alone and say so.
+        let Some(observed) = chain.tx_block_height(&txid)? else {
+            log::warn!(
+                "[{}] Fidelity bond {} is not on our chain; keeping height {}",
+                maker.config.network_port,
+                txid,
+                stored
+            );
+            continue;
+        };
+        let observed = observed as u32;
+        if observed == stored {
+            continue;
+        }
+
+        log::info!(
+            "[{}] Fidelity bond {} moved from height {} to {}; correcting the advertisement",
+            maker.config.network_port,
+            txid,
+            stored,
+            observed
+        );
+        lock_debug!(maker.wallet.write())
+            .map_err(|_| MakerError::General("Failed to lock wallet"))?
+            .update_fidelity_bond_conf_details(index, observed)?;
     }
 
     Ok(())
@@ -1422,12 +1490,13 @@ fn recover_from_swap(
             let legacy_funding_shared = outgoing_swapcoins
                 .first()
                 .is_some_and(|sc| sc.protocol == ProtocolVersion::Legacy);
+            let swap_scope = HashSet::from([swap_id.clone()]);
             let recovered = Wallet::recover_timelocked_swapcoins(
                 &maker.wallet,
                 chain,
                 RECOVERY_FEE_RATE,
                 &maker.shutdown,
-                Some(&swap_id),
+                Some(&swap_scope),
                 // Legacy funding rides the contract-sig response, so the peer
                 // may hold it even when we never broadcast. The pass is scoped
                 // to one swap, so every coin gets the same answer.

@@ -21,12 +21,12 @@ fn test_standard_openswap() {
     // ---- Setup ----
     warn!("Running Test: Standard OpenSwap Procedure");
 
-    let makers_config_map = vec![(6102, Some(19051)), (16102, Some(19052))];
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(makers_config_map, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -256,29 +256,26 @@ fn test_standard_openswap() {
 /// swap still completes.
 #[test]
 fn test_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 9203, 21503, 3846, 112);
+    run_swap_with_custom_feerate(ProtocolVersion::Taproot, 3846, 112);
 }
 
 /// Same 3 sats/vB swap on Legacy: funding txs price their real vsize and the
 /// multisig contract sweeps pay the 150 vB model at the negotiated rate.
 #[test]
 fn test_legacy_swap_with_custom_feerate() {
-    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 9204, 21504, 4302, 150);
+    run_swap_with_custom_feerate(ProtocolVersion::Legacy, 4302, 150);
 }
 
 fn run_swap_with_custom_feerate(
     protocol: ProtocolVersion,
-    port: u16,
-    rpc: u16,
     expected_fee_paid: u64,
     sweep_vsize_model: u64,
 ) {
     warn!("Running Test: OpenSwap with a custom feerate");
 
-    let makers_config_map = vec![(port, Some(rpc))];
     let (test_framework, mut takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
@@ -365,10 +362,9 @@ fn run_swap_with_custom_feerate(
 fn taproot_swap_survives_unconfirmed_confirmation_wait() {
     warn!("Running Test: maker confirmation wait survives the idle timeout");
 
-    let makers_config_map = vec![(9203, Some(21503))];
     let (test_framework, takers, makers, block_generation_handle) =
         TestFramework::init::<BitcoindBackend>(
-            makers_config_map,
+            1,
             vec![TakerBehavior::Normal],
             vec![MakerBehavior::Normal],
         );
