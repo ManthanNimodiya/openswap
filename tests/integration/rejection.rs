@@ -3234,11 +3234,12 @@ fn swap_cap_rejects_before_planning() {
 fn an_unpriceable_offer_sidelines_without_banning() {
     warn!("Running Test: Unpriceable Offer Sidelines Without Banning");
 
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::SendMalformedOffer, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(2, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -3306,6 +3307,7 @@ fn an_unpriceable_offer_sidelines_without_banning() {
 fn wrong_key_sender_signatures_ban_their_signer() {
     warn!("Running Test: Wrong-Key Sender Signatures Ban Their Signer");
 
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![
         MakerBehavior::SignSenderContractsWithWrongKey,
@@ -3313,7 +3315,7 @@ fn wrong_key_sender_signatures_ban_their_signer() {
     ];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(2, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -3480,11 +3482,12 @@ fn wrong_key_sender_signatures_ban_their_signer() {
 fn wrong_hashlock_key_bans_its_builder() {
     warn!("Running Test: Wrong Hashlock Key Bans Its Builder");
 
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::WrongHashlockKey, MakerBehavior::Normal];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(2, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
@@ -3562,11 +3565,12 @@ fn wrong_hashlock_key_bans_its_builder() {
 fn wrong_handover_key_bans_the_last_maker() {
     warn!("Running Test: Wrong Handover Key Bans The Last Maker");
 
+    let maker_count = 2;
     let taker_behavior = vec![TakerBehavior::Normal];
     let maker_behaviors = vec![MakerBehavior::Normal, MakerBehavior::SendWrongHandoverKey];
 
     let (test_framework, mut takers, makers, block_generation_handle) =
-        TestFramework::init::<BitcoindBackend>(2, taker_behavior, maker_behaviors);
+        TestFramework::init::<BitcoindBackend>(maker_count, taker_behavior, maker_behaviors);
 
     let bitcoind = &test_framework.bitcoind;
     let taker = takers.get_mut(0).unwrap();
