@@ -2928,7 +2928,7 @@ mod tests {
     #[test]
     fn min_swap_amount_allows_flexible_economic_floor_above_dust() {
         let timelock = if cfg!(feature = "integration-test") {
-            1
+            950
         } else {
             15_000
         };
