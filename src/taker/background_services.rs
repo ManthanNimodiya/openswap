@@ -19,7 +19,7 @@ use bitcoin::{OutPoint, ScriptBuf, Txid};
 use crate::{
     lock_debug,
     taker::error::TakerError,
-    utill::{HEART_BEAT_INTERVAL, RECOVERY_FEE_RATE},
+    utill::HEART_BEAT_INTERVAL,
     wallet::{AnyBlockchain, Blockchain, RecoveryReport, Wallet},
     watch_tower::{service::WatchService, watcher::WatcherEvent},
 };
@@ -125,7 +125,6 @@ impl RecoveryLoop {
                     let outgoing_result = match Wallet::recover_timelocked_swapcoins(
                         &wallet,
                         &chain,
-                        RECOVERY_FEE_RATE,
                         &shutdown_clone,
                         Some(&swap_ids),
                         &|coin_swap| funding_shared(&swap_tracker, coin_swap),
@@ -193,8 +192,19 @@ impl RecoveryLoop {
                         log::info!("Recovery loop: all contracts resolved");
                         if let Ok(mut w) = lock_debug!(wallet.write()) {
                             for swap_id in &swap_ids {
-                                let keys = w.outgoing_keys_for_swap(swap_id);
-                                for key in &keys {
+                                // A sweep normally removes its incoming entry
+                                // after confirmation. If the process stops
+                                // after broadcast but before that removal, a
+                                // restarted recovery sees the outpoint spent
+                                // and arrives here with a stale incoming entry.
+                                // Since `all_resolved` is based on confirmed
+                                // spends, it is now safe to remove both sides.
+                                let incoming_keys = w.incoming_keys_for_swap(swap_id);
+                                for key in &incoming_keys {
+                                    w.remove_incoming_swapcoin(key);
+                                }
+                                let outgoing_keys = w.outgoing_keys_for_swap(swap_id);
+                                for key in &outgoing_keys {
                                     w.remove_outgoing_swapcoin(key);
                                 }
                                 w.remove_watchonly_swapcoins(swap_id);

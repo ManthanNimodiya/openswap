@@ -40,10 +40,10 @@ use crate::{
     lock_debug,
     protocol::contract::create_multisig_redeemscript,
     utill::{
-        compute_checksum, fee_at_rate_sats, generate_keypair, get_hd_path_from_descriptor,
-        now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL, LEGACY_CONTRACT_SPEND_VSIZE,
-        RECOVERY_FEE_RATE, TAPROOT_KEYPATH_VSIZE, TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT,
-        UNFUNDED_SWAP_LIFETIME,
+        capped_fee, compute_checksum, fee_at_rate_sats, generate_keypair,
+        get_hd_path_from_descriptor, now_secs, redeemscript_to_scriptpubkey, HEART_BEAT_INTERVAL,
+        LEGACY_CONTRACT_SPEND_VSIZE, MIN_RELAY_FEE_RATE, TAPROOT_KEYPATH_VSIZE,
+        TX_BROADCAST_TIMEOUT, TX_CONFIRMATION_TIMEOUT, UNFUNDED_SWAP_LIFETIME,
     },
 };
 
@@ -915,6 +915,16 @@ impl Wallet {
             .collect()
     }
 
+    /// Returns contract_txid keys of incoming swapcoins matching a swap_id.
+    pub(crate) fn incoming_keys_for_swap(&self, swap_id: &str) -> Vec<String> {
+        self.store
+            .incoming_swapcoins
+            .iter()
+            .filter(|(_, sc)| sc.swap_id.as_deref() == Some(swap_id))
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
     /// Ensure a swapcoin's contract tx is on-chain, broadcasting it when needed.
     ///
     /// Every answer comes from a chain query, never from parsing backend error
@@ -1041,8 +1051,8 @@ impl Wallet {
     /// on it with no wallet guard held, so a slow tx cannot wedge the wallet.
     /// Without `swap_scope` every eligible outgoing swapcoin is considered.
     ///
-    /// `feerate` must be our own: the peer that abandoned the swap does not get
-    /// to price our refund. Callers pass [`crate::utill::RECOVERY_FEE_RATE`].
+    /// Each coin's feerate is read from our own backend just before its recovery
+    /// is built: the peer that abandoned the swap does not get to price it.
     ///
     /// `funding_shared_with_peer` answers per coin whether the peer may hold
     /// its funding txs. Unshared funding can never land on-chain, so its
@@ -1051,7 +1061,6 @@ impl Wallet {
     pub fn recover_timelocked_swapcoins(
         wallet: &std::sync::RwLock<Wallet>,
         chain: &AnyBlockchain,
-        fee_rate: f64,
         shutdown: &std::sync::atomic::AtomicBool,
         swap_scope: Option<&HashSet<String>>,
         funding_shared_with_peer: &dyn Fn(Option<&str>) -> bool,
@@ -1193,8 +1202,8 @@ impl Wallet {
                 Err(e) => return Err(e),
             }
 
-            // A retry must rebuild the same transaction. Persist its destination
-            // before broadcasting so a failed wait cannot burn another index.
+            // A retry must pay the same destination. Persist it before
+            // broadcasting so a failed wait cannot burn another index.
             let recovery_address = {
                 let mut w = lock_debug!(wallet.write())
                     .map_err(|_| WalletError::General("wallet lock poisoned".to_string()))?;
@@ -1226,7 +1235,9 @@ impl Wallet {
                 })?
             };
 
-            match Self::create_timelock_recovery_tx(&swapcoin, fee_rate, recovery_address) {
+            // Priced per coin: an earlier coin's confirmation wait can outlast any rate.
+            let fee_rates = chain.recovery_feerates();
+            match Self::create_timelock_recovery_tx(&swapcoin, &fee_rates, recovery_address) {
                 Ok(recovery_tx) => {
                     match chain.send_raw_transaction(&recovery_tx) {
                         Ok(txid) => {
@@ -1296,7 +1307,7 @@ impl Wallet {
     /// Create a recovery transaction for a timelocked outgoing swapcoin.
     fn create_timelock_recovery_tx(
         swapcoin: &super::swapcoin::OutgoingSwapCoin,
-        fee_rate: f64,
+        fee_rates: &[f64],
         recovery_address: Address,
     ) -> Result<bitcoin::Transaction, WalletError> {
         use bitcoin::{locktime::absolute::LockTime, transaction::Version, Sequence, TxIn, TxOut};
@@ -1315,21 +1326,18 @@ impl Wallet {
 
         let vsize = contract_and_timelock_vsize(swapcoin.protocol, SpendKind::Timelock);
 
-        let fee = Amount::from_sat(
-            fee_at_rate_sats(vsize, fee_rate)
-                .ok_or_else(|| WalletError::General("unusable feerate".to_string()))?,
-        );
-        let output_amount = contract_output.value.checked_sub(fee).ok_or_else(|| {
-            WalletError::General("Insufficient funds for recovery fee".to_string())
-        })?;
+        let script_pubkey = recovery_address.script_pubkey();
+        let fee = capped_fee(fee_rates, vsize, contract_output.value, &script_pubkey)
+            .ok_or_else(|| WalletError::General("No feerate leaves a relayable output".into()))?;
 
         // Legacy (CSV): nSequence encodes relative locktime, nLockTime = 0.
-        // Taproot (CLTV): nLockTime = absolute height, nSequence enables locktime.
+        // Taproot (CLTV): nLockTime = absolute height. Both nSequence forms
+        // signal RBF, so an underpriced recovery can be replaced.
         let (lock_time, sequence) =
             if swapcoin.protocol == crate::protocol::ProtocolVersion::Taproot {
                 (
                     LockTime::from_height(timelock).unwrap_or(LockTime::ZERO),
-                    Sequence::ENABLE_LOCKTIME_NO_RBF,
+                    Sequence::ENABLE_RBF_NO_LOCKTIME,
                 )
             } else {
                 (LockTime::ZERO, Sequence::from_height(timelock as u16))
@@ -1348,8 +1356,8 @@ impl Wallet {
                 witness: bitcoin::Witness::new(),
             }],
             output: vec![TxOut {
-                value: output_amount,
-                script_pubkey: recovery_address.script_pubkey(),
+                value: contract_output.value - fee,
+                script_pubkey,
             }],
         };
 
@@ -2554,6 +2562,15 @@ impl Wallet {
         manually_selected_outpoints: Option<Vec<OutPoint>>,
         excluded_outpoints: Option<Vec<OutPoint>>,
     ) -> Result<Vec<(ListUnspentResultEntry, UTXOSpendInfo)>, WalletError> {
+        // `target + fee` below is plain u64 arithmetic, so an amount near the
+        // top of the range wraps in release and panics in debug, leaving the
+        // wallet lock poisoned for every later call.
+        if amount > Amount::MAX_MONEY {
+            return Err(WalletError::General(
+                "Amount is above the 21M BTC cap".to_string(),
+            ));
+        }
+
         const LONG_TERM_FEERATE: f32 = 10.0;
         // (version 4 + input varint 1 + output varint 1 + locktime 4) * 4 + marker 1 + flag 1 = 42 WU
         const BASE_TXN_ONLY_WEIGHT: u64 = 42;
@@ -3271,7 +3288,7 @@ impl Wallet {
                         &address.script_pubkey(),
                         // A stored rate below the relay floor can never relay;
                         // recover at the floor instead of retrying it forever.
-                        (swapcoin.negotiated_feerate as f64).max(RECOVERY_FEE_RATE),
+                        (swapcoin.negotiated_feerate as f64).max(MIN_RELAY_FEE_RATE),
                     );
                     (Some(address), spend)
                 }
@@ -4098,6 +4115,52 @@ pub(crate) mod test_support {
             locked_utxos: HashSet::new(),
             restore_scan: false,
         }
+    }
+}
+
+#[cfg(test)]
+mod coin_select_cap_tests {
+    use super::{test_support::test_wallet, *};
+    use crate::utill::MIN_RELAY_FEE_RATE;
+    use bitcoind::tempfile::tempdir;
+
+    #[test]
+    fn coin_select_rejects_amounts_above_the_cap() {
+        let dir = tempdir().unwrap();
+        let wallet = test_wallet(&dir.path().join("cap-test-wallet"));
+
+        // `target + fee` inside coin_select is plain u64 arithmetic.
+        for amount in [
+            Amount::from_sat(u64::MAX),
+            Amount::MAX_MONEY + Amount::ONE_SAT,
+        ] {
+            let err = wallet
+                .coin_select(amount, MIN_RELAY_FEE_RATE, AddressType::P2WPKH, None, None)
+                .unwrap_err();
+            assert!(
+                format!("{:?}", err).contains("21M"),
+                "{} sats must trip the cap: {:?}",
+                amount.to_sat(),
+                err
+            );
+        }
+
+        // The cap itself is spendable as far as this check is concerned, so a
+        // `>=` here would be wrong; it fails later for want of funds.
+        let err = wallet
+            .coin_select(
+                Amount::MAX_MONEY,
+                MIN_RELAY_FEE_RATE,
+                AddressType::P2WPKH,
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, WalletError::InsufficientFund { .. }),
+            "the cap itself must reach coin selection, not the guard: {:?}",
+            err
+        );
     }
 }
 
