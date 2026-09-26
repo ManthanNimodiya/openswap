@@ -964,6 +964,17 @@ impl Wallet {
                     .filter(|tx| swapcoin.is_own_timelock_spend(tx))
                 {
                     let recovery_txid = recovery.compute_txid();
+                    // Electrum returns the first history entry spending the
+                    // outpoint, which can be a replaced recovery. Record only the
+                    // one that confirmed; otherwise decide on the next pass.
+                    if chain.tx_block_height(&recovery_txid)?.is_none() {
+                        log::info!(
+                            "Our timelock recovery {} for {} is not the confirmed spend — retrying next cycle",
+                            recovery_txid,
+                            swap_id
+                        );
+                        return Ok(ContractChainState::NotYet);
+                    }
                     log::info!(
                         "Contract output for {} already spent by our confirmed timelock recovery {} — recording as resolved",
                         swap_id,
