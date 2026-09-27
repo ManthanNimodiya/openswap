@@ -957,30 +957,30 @@ impl Wallet {
             let outpoint = OutPoint::new(contract_txid, contract_vout);
             let script = &swapcoin.contract_tx.output[contract_vout as usize].script_pubkey;
             if chain.is_confirmed_spend(&outpoint, script)? {
-                // The spend may be our own timelock recovery whose bookkeeping
-                // was lost to a crash or a failed confirmation wait.
-                if let Some(recovery) = chain
-                    .spending_transaction(&outpoint, script, None)?
-                    .filter(|tx| swapcoin.is_own_timelock_spend(tx))
-                {
-                    let recovery_txid = recovery.compute_txid();
-                    // Electrum returns the first history entry spending the
-                    // outpoint, which can be a replaced recovery. Record only the
-                    // one that confirmed; otherwise decide on the next pass.
-                    if chain.tx_block_height(&recovery_txid)?.is_none() {
+                if let Some(spender) = chain.spending_transaction(&outpoint, script, None)? {
+                    let spender_txid = spender.compute_txid();
+                    // Classify only from the confirmed spend. Electrum returns the
+                    // first history entry spending the outpoint, which can be an
+                    // unconfirmed conflict (e.g. a replaced recovery) rather than
+                    // the one that mined; decide on the next pass instead.
+                    if chain.tx_block_height(&spender_txid)?.is_none() {
                         log::info!(
-                            "Our timelock recovery {} for {} is not the confirmed spend — retrying next cycle",
-                            recovery_txid,
+                            "Spend {} of the contract for {} is not the confirmed one — retrying next cycle",
+                            spender_txid,
                             swap_id
                         );
                         return Ok(ContractChainState::NotYet);
                     }
-                    log::info!(
-                        "Contract output for {} already spent by our confirmed timelock recovery {} — recording as resolved",
-                        swap_id,
-                        recovery_txid
-                    );
-                    return Ok(ContractChainState::RecoveredByTimelock(recovery_txid));
+                    // The spend may be our own timelock recovery whose
+                    // bookkeeping was lost to a crash or a failed confirmation wait.
+                    if swapcoin.is_own_timelock_spend(&spender) {
+                        log::info!(
+                            "Contract output for {} already spent by our confirmed timelock recovery {} — recording as resolved",
+                            swap_id,
+                            spender_txid
+                        );
+                        return Ok(ContractChainState::RecoveredByTimelock(spender_txid));
+                    }
                 }
                 log::info!(
                     "Contract output for {} spent by a confirmed tx — discarding swapcoin",

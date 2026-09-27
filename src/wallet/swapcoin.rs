@@ -1361,7 +1361,7 @@ mod timelock_spend_tests {
     use bitcoin::{
         locktime::absolute::LockTime,
         secp256k1::Secp256k1,
-        taproot::{LeafVersion, TaprootBuilder},
+        taproot::{ControlBlock, LeafVersion, TaprootBuilder, TaprootSpendInfo},
         transaction::Version,
         TxIn, TxOut,
     };
@@ -1425,14 +1425,31 @@ mod timelock_spend_tests {
         )
     }
 
+    /// The contract's tap tree: both leaves under `internal_key`, as the signer builds it.
+    fn spend_info(
+        hashlock_script: &ScriptBuf,
+        timelock_script: &ScriptBuf,
+        internal_key: XOnlyPublicKey,
+    ) -> TaprootSpendInfo {
+        TaprootBuilder::new()
+            .add_leaf(1, hashlock_script.clone())
+            .unwrap()
+            .add_leaf(1, timelock_script.clone())
+            .unwrap()
+            .finalize(&Secp256k1::new(), internal_key)
+            .unwrap()
+    }
+
     fn taproot_coin() -> OutgoingSwapCoin {
         let hashlock_script = create_hashlock_script(&[7; 32], &xonly(2));
         let timelock_script =
             create_timelock_script(LockTime::from_height(500).unwrap(), &xonly(3));
+        // The output commits to both leaves, so a spend's control block proves its leaf.
+        let merkle_root = spend_info(&hashlock_script, &timelock_script, xonly(5)).merkle_root();
         let contract_tx = tx(
             OutPoint::null(),
             Witness::new(),
-            ScriptBuf::new_p2tr(&Secp256k1::new(), xonly(5), None),
+            ScriptBuf::new_p2tr(&Secp256k1::new(), xonly(5), merkle_root),
         );
         let mut coin = OutgoingSwapCoin::new_taproot(
             key(3),
@@ -1449,16 +1466,14 @@ mod timelock_spend_tests {
 
     /// The control block a real script-path spend of `leaf` would carry.
     fn control_block(coin: &OutgoingSwapCoin, leaf: &ScriptBuf) -> Vec<u8> {
-        TaprootBuilder::new()
-            .add_leaf(1, coin.hashlock_script.clone().unwrap())
-            .unwrap()
-            .add_leaf(1, coin.timelock_script.clone().unwrap())
-            .unwrap()
-            .finalize(&Secp256k1::new(), coin.internal_key.unwrap())
-            .unwrap()
-            .control_block(&(leaf.clone(), LeafVersion::TapScript))
-            .unwrap()
-            .serialize()
+        spend_info(
+            coin.hashlock_script.as_ref().unwrap(),
+            coin.timelock_script.as_ref().unwrap(),
+            coin.internal_key.unwrap(),
+        )
+        .control_block(&(leaf.clone(), LeafVersion::TapScript))
+        .unwrap()
+        .serialize()
     }
 
     #[test]
@@ -1467,6 +1482,18 @@ mod timelock_spend_tests {
         let recovery = coin
             .sign_timelock_recovery(spend(&coin, Witness::new()))
             .unwrap();
+        // The fixture is realistic: the recovery's control block proves its
+        // leaf against the contract output's key.
+        let witness = &recovery.input[0].witness;
+        let control_block = ControlBlock::decode(witness.taproot_control_block().unwrap()).unwrap();
+        let output_key =
+            XOnlyPublicKey::from_slice(&coin.contract_tx.output[0].script_pubkey.as_bytes()[2..])
+                .unwrap();
+        assert!(control_block.verify_taproot_commitment(
+            &Secp256k1::new(),
+            output_key,
+            witness.taproot_leaf_script().unwrap().script,
+        ));
         assert!(coin.is_own_timelock_spend(&recovery));
     }
 
