@@ -958,30 +958,21 @@ impl Wallet {
             let outpoint = OutPoint::new(contract_txid, contract_vout);
             let script = &swapcoin.contract_tx.output[contract_vout as usize].script_pubkey;
             if chain.is_confirmed_spend(&outpoint, script)? {
-                if let Some(spender) = chain.spending_transaction(&outpoint, script, None)? {
-                    let spender_txid = spender.compute_txid();
-                    // Classify only from the confirmed spend. Electrum returns the
-                    // first history entry spending the outpoint, which can be an
-                    // unconfirmed conflict (e.g. a replaced recovery) rather than
-                    // the one that mined; decide on the next pass instead.
-                    if chain.tx_block_height(&spender_txid)?.is_none() {
-                        log::info!(
-                            "Spend {} of the contract for {} is not the confirmed one — retrying next cycle",
-                            spender_txid,
-                            swap_id
-                        );
-                        return Ok(ContractChainState::NotYet);
-                    }
-                    // The spend may be our own timelock recovery whose
-                    // bookkeeping was lost to a crash or a failed confirmation wait.
-                    if swapcoin.is_own_timelock_spend(&spender) {
-                        log::info!(
-                            "Contract output for {} already spent by our confirmed timelock recovery {} — recording as resolved",
-                            swap_id,
-                            spender_txid
-                        );
-                        return Ok(ContractChainState::RecoveredByTimelock(spender_txid));
-                    }
+                // The spend may be our own timelock recovery whose bookkeeping
+                // was lost to a crash or a failed confirmation wait. Look only at
+                // the mined spender: Electrum history can list an unconfirmed
+                // conflict, such as a replaced recovery, ahead of it.
+                if let Some(recovery) = chain
+                    .confirmed_spending_transaction(&outpoint, script)?
+                    .filter(|tx| swapcoin.is_own_timelock_spend(tx))
+                {
+                    let recovery_txid = recovery.compute_txid();
+                    log::info!(
+                        "Contract output for {} already spent by our confirmed timelock recovery {} — recording as resolved",
+                        swap_id,
+                        recovery_txid
+                    );
+                    return Ok(ContractChainState::RecoveredByTimelock(recovery_txid));
                 }
                 log::info!(
                     "Contract output for {} spent by a confirmed tx — discarding swapcoin",
@@ -4827,15 +4818,77 @@ mod timelock_reconcile_tests {
     }
 
     /// Electrum can list a replaced, never-mined recovery ahead of the one that
-    /// confirmed. Classifying from it would record the wrong txid, so the coin
-    /// waits for a later pass instead.
+    /// confirmed. Classification must skip it and record the mined recovery.
     #[test]
-    fn electrum_waits_when_history_lists_an_unconfirmed_spend_first() {
+    fn electrum_skips_an_unconfirmed_spend_listed_first() {
         let (coin, recovery, replaced) = legacy_coin_and_recoveries();
-        let url = start_electrum_stub_with(coin.contract_tx.clone(), recovery, Some(replaced));
+        let url =
+            start_electrum_stub_with(coin.contract_tx.clone(), recovery.clone(), Some(replaced));
         let state =
             Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
-        assert_eq!(state, ContractChainState::NotYet);
+        assert_eq!(
+            state,
+            ContractChainState::RecoveredByTimelock(recovery.compute_txid())
+        );
+    }
+
+    /// A Taproot outgoing swapcoin whose contract output commits to both
+    /// leaves, and our own signed timelock recovery of it.
+    fn taproot_coin_and_recovery() -> (OutgoingSwapCoin, Transaction) {
+        use crate::protocol::contract2::{create_hashlock_script, create_timelock_script};
+        use bitcoin::{key::Keypair, secp256k1::Scalar, taproot::TaprootBuilder, XOnlyPublicKey};
+
+        let secp = crate::utill::global_secp();
+        let xonly = |byte| -> XOnlyPublicKey {
+            Keypair::from_secret_key(secp, &key(byte))
+                .x_only_public_key()
+                .0
+        };
+        let hashlock_script = create_hashlock_script(&[7; 32], &xonly(2));
+        let timelock_script =
+            create_timelock_script(LockTime::from_height(500).unwrap(), &xonly(3));
+        let merkle_root = TaprootBuilder::new()
+            .add_leaf(1, hashlock_script.clone())
+            .unwrap()
+            .add_leaf(1, timelock_script.clone())
+            .unwrap()
+            .finalize(secp, xonly(5))
+            .unwrap()
+            .merkle_root();
+        let contract_tx = tx(
+            OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+            50_000,
+            ScriptBuf::new_p2tr(secp, xonly(5), merkle_root),
+        );
+        let mut coin = OutgoingSwapCoin::new_taproot(
+            key(3),
+            hashlock_script,
+            timelock_script,
+            contract_tx,
+            Amount::from_sat(50_000),
+            1,
+        );
+        coin.internal_key = Some(xonly(5));
+        coin.tap_tweak = Some(Scalar::ZERO);
+        let unsigned = tx(
+            OutPoint::new(coin.contract_tx.compute_txid(), 0),
+            49_000,
+            ScriptBuf::new_p2wpkh(&pubkey(5).wpubkey_hash().unwrap()),
+        );
+        let recovery = coin.sign_timelock_recovery(unsigned).unwrap();
+        (coin, recovery)
+    }
+
+    #[test]
+    fn electrum_classifies_our_confirmed_taproot_recovery_as_recovered() {
+        let (coin, recovery) = taproot_coin_and_recovery();
+        let url = start_electrum_stub(coin.contract_tx.clone(), recovery.clone());
+        let state =
+            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
+        assert_eq!(
+            state,
+            ContractChainState::RecoveredByTimelock(recovery.compute_txid())
+        );
     }
 
     /// Hand-rolled Bitcoin Core JSON-RPC over HTTP: the contract is mined at

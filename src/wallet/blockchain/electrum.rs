@@ -314,6 +314,29 @@ impl Electrum {
         Ok(None)
     }
 
+    /// The mined transaction spending `outpoint`, skipping mempool entries.
+    ///
+    /// Unlike [`Self::spending_transaction`], an unconfirmed conflict listed
+    /// first in history (a replaced tx, say) is passed over for the spend that
+    /// mined. Anyone can deposit to a public contract script, so a mined tx
+    /// only counts if one of its inputs consumes our outpoint.
+    pub(crate) fn confirmed_spending_transaction(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+    ) -> Result<Option<Transaction>, WalletError> {
+        for entry in self.call(|c| c.script_get_history(script))? {
+            if entry.tx_hash == outpoint.txid || entry.height <= 0 {
+                continue;
+            }
+            let tx = self.get_raw_transaction(&entry.tx_hash, None)?;
+            if tx.input.iter().any(|i| i.previous_output == *outpoint) {
+                return Ok(Some(tx));
+            }
+        }
+        Ok(None)
+    }
+
     /// Connect to an Electrum server and derive the network from its genesis
     /// hash. Used by `AnyBlockchain::from_config`; each consumer gets its own
     /// connection.

@@ -419,6 +419,26 @@ impl AnyBlockchain {
         }
     }
 
+    /// The mined transaction spending `outpoint`; unlike
+    /// [`Self::spending_transaction`], never a mempool spend. Recovery
+    /// classifies an already-spent contract from this, and an unconfirmed
+    /// conflict listed first must not decide it.
+    pub(crate) fn confirmed_spending_transaction(
+        &self,
+        outpoint: &OutPoint,
+        script: &Script,
+    ) -> Result<Option<Transaction>, WalletError> {
+        match self {
+            // Core's lookup falls through to a block scan once the mempool has
+            // no spender; the height check keeps a mempool answer out.
+            AnyBlockchain::CoreRPC(b) => match b.spending_transaction(outpoint)? {
+                Some(tx) if b.tx_block_height(&tx.compute_txid())?.is_some() => Ok(Some(tx)),
+                _ => Ok(None),
+            },
+            AnyBlockchain::Electrum(b) => b.confirmed_spending_transaction(outpoint, script),
+        }
+    }
+
     /// Recovery feerates in sat/vB, always including the relay floor. A failed
     /// estimate drops only its rate; a dead Electrum link stops the rest.
     pub(crate) fn recovery_feerates(&self) -> Vec<f64> {
