@@ -369,6 +369,7 @@ pub struct RecoveryOutcome {
 }
 
 /// Chain state of one swapcoin's contract output on a recovery pass.
+#[derive(Debug, PartialEq, Eq)]
 enum ContractChainState {
     /// The output is on-chain or was just broadcast; recovery can proceed.
     OnChain,
@@ -4526,6 +4527,478 @@ mod restore_history_probe_tests {
             wallet.sync_and_save(&shutdown),
             Err(WalletError::Interrupted("Shutdown requested"))
         ));
+    }
+}
+
+/// A recovery pass that finds our own timelock recovery already confirmed must
+/// record it as resolved with its txid, drop the swapcoin, persist that, and
+/// leave nothing for the next pass. Run against stubbed backends.
+#[cfg(test)]
+mod timelock_reconcile_tests {
+    use super::*;
+    use crate::{
+        protocol::contract::{create_contract_redeemscript, Hash160},
+        wallet::{blockchain::Electrum, swapcoin::OutgoingSwapCoin},
+    };
+    use bitcoin::{
+        consensus::encode::serialize_hex, hashes::Hash, locktime::absolute::LockTime, BlockHash,
+        TxIn,
+    };
+    use bitcoind::tempfile::tempdir;
+    use std::{
+        io::{BufRead, BufReader, Write as IoWrite},
+        net::TcpListener,
+        sync::{atomic::AtomicBool, Arc, RwLock},
+    };
+
+    const CONTRACT_HEIGHT: i64 = 5;
+    const RECOVERY_HEIGHT: i64 = 6;
+    const TIP: i64 = 10;
+    const PASSWORD: &str = "test-password";
+
+    fn key(byte: u8) -> SecretKey {
+        SecretKey::from_slice(&[byte; 32]).unwrap()
+    }
+
+    fn pubkey(byte: u8) -> PublicKey {
+        PublicKey::new(bitcoin::secp256k1::PublicKey::from_secret_key(
+            crate::utill::global_secp(),
+            &key(byte),
+        ))
+    }
+
+    fn tx(previous_output: OutPoint, value: u64, script_pubkey: ScriptBuf) -> Transaction {
+        Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output,
+                ..Default::default()
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(value),
+                script_pubkey,
+            }],
+        }
+    }
+
+    /// A Legacy outgoing swapcoin with a confirmed contract, and our own signed
+    /// timelock recovery of it.
+    fn legacy_coin_and_recovery() -> (OutgoingSwapCoin, Transaction) {
+        let (coin, recovery, _) = legacy_coin_and_recoveries();
+        (coin, recovery)
+    }
+
+    /// Also returns a second, differently priced recovery: one it replaced.
+    fn legacy_coin_and_recoveries() -> (OutgoingSwapCoin, Transaction, Transaction) {
+        let redeemscript =
+            create_contract_redeemscript(&pubkey(2), &pubkey(3), &Hash160::all_zeros(), &20);
+        let contract_tx = tx(
+            OutPoint::new(Txid::from_byte_array([9; 32]), 0),
+            50_000,
+            redeemscript.to_p2wsh(),
+        );
+        let coin = OutgoingSwapCoin::new_legacy(
+            key(1),
+            pubkey(4),
+            contract_tx,
+            redeemscript,
+            key(3),
+            Amount::from_sat(50_000),
+            1,
+        );
+        let recovery_spk = ScriptBuf::new_p2wpkh(&pubkey(5).wpubkey_hash().unwrap());
+        let recovery_at = |value| {
+            let unsigned = tx(
+                OutPoint::new(coin.contract_tx.compute_txid(), 0),
+                value,
+                recovery_spk.clone(),
+            );
+            coin.sign_timelock_recovery(unsigned).unwrap()
+        };
+        let (recovery, replaced) = (recovery_at(49_000), recovery_at(49_500));
+        (coin, recovery, replaced)
+    }
+
+    fn scripthash(script: &Script) -> String {
+        use bitcoin::hex::DisplayHex;
+        use electrum_client::ToElectrumScriptHash;
+        script.to_electrum_scripthash().to_lower_hex_string()
+    }
+
+    /// Electrum server knowing the contract (mined at `CONTRACT_HEIGHT`) and
+    /// our recovery spending it (mined at `RECOVERY_HEIGHT`). Every other
+    /// script is empty and every other txid unknown.
+    fn start_electrum_stub(contract: Transaction, recovery: Transaction) -> String {
+        start_electrum_stub_with(contract, recovery, None)
+    }
+
+    /// As [`start_electrum_stub`], with `stale` (never mined, also spending the
+    /// contract) listed in the contract's history ahead of `recovery`.
+    fn start_electrum_stub_with(
+        contract: Transaction,
+        recovery: Transaction,
+        stale: Option<Transaction>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let url = format!("tcp://{}", listener.local_addr().unwrap());
+        let genesis = bitcoin::constants::genesis_block(bitcoin::Network::Regtest);
+        let genesis_hash = genesis.block_hash().to_string();
+        let header_hex = serialize_hex(&genesis.header);
+        let entry = |tx: &Transaction, height: i64| json!({"tx_hash": tx.compute_txid().to_string(), "height": height});
+        let mut contract_history = vec![entry(&contract, CONTRACT_HEIGHT)];
+        let mut recovery_history = Vec::new();
+        let mut txs = HashMap::from([
+            (
+                contract.compute_txid().to_string(),
+                serialize_hex(&contract),
+            ),
+            (
+                recovery.compute_txid().to_string(),
+                serialize_hex(&recovery),
+            ),
+        ]);
+        if let Some(stale) = &stale {
+            contract_history.push(entry(stale, 0));
+            recovery_history.push(entry(stale, 0));
+            txs.insert(stale.compute_txid().to_string(), serialize_hex(stale));
+        }
+        contract_history.push(entry(&recovery, RECOVERY_HEIGHT));
+        recovery_history.push(entry(&recovery, RECOVERY_HEIGHT));
+        let history = HashMap::from([
+            (
+                scripthash(&contract.output[0].script_pubkey),
+                Value::Array(contract_history),
+            ),
+            (
+                scripthash(&recovery.output[0].script_pubkey),
+                Value::Array(recovery_history),
+            ),
+        ]);
+
+        thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else { continue };
+                let _ = stream.set_nodelay(true);
+                let (genesis_hash, header_hex) = (genesis_hash.clone(), header_hex.clone());
+                let (history, txs) = (history.clone(), txs.clone());
+                thread::spawn(move || {
+                    let answer = |req: &Value| -> Value {
+                        let param = req["params"][0].as_str().unwrap_or_default();
+                        let result = match req["method"].as_str().unwrap_or_default() {
+                            "server.features" => json!({
+                                "server_version": "stub",
+                                "genesis_hash": genesis_hash,
+                                "protocol_min": "1.4",
+                                "protocol_max": "1.4",
+                                "hash_function": "sha256",
+                                "pruning": Value::Null,
+                            }),
+                            "blockchain.headers.subscribe" => {
+                                json!({"height": TIP, "hex": header_hex})
+                            }
+                            "blockchain.block.header" => json!(header_hex),
+                            "blockchain.scripthash.get_history" => {
+                                history.get(param).cloned().unwrap_or(json!([]))
+                            }
+                            "blockchain.scripthash.listunspent" => json!([]),
+                            "blockchain.transaction.get" => match txs.get(param) {
+                                Some(hex) => json!(hex),
+                                None => {
+                                    return json!({"jsonrpc": "2.0", "id": req["id"], "error": {
+                                        "code": 2,
+                                        "message": "No such mempool or blockchain transaction",
+                                    }})
+                                }
+                            },
+                            _ => Value::Null,
+                        };
+                        json!({"jsonrpc": "2.0", "id": req["id"], "result": result})
+                    };
+                    let mut out = stream.try_clone().expect("clone stub stream");
+                    for line in BufReader::new(stream).lines() {
+                        let Ok(line) = line else { return };
+                        let Ok(req) = serde_json::from_str::<Value>(&line) else {
+                            return;
+                        };
+                        let resp = match req.as_array() {
+                            Some(batch) => Value::Array(batch.iter().map(answer).collect()),
+                            None => answer(&req),
+                        };
+                        if writeln!(out, "{resp}").is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        url
+    }
+
+    fn electrum(url: &str) -> AnyBlockchain {
+        AnyBlockchain::Electrum(
+            Electrum::new(&crate::wallet::ElectrumConfig {
+                url: url.to_string(),
+                ..Default::default()
+            })
+            .expect("connect to stub"),
+        )
+    }
+
+    fn stub_wallet(path: &Path, blockchain: AnyBlockchain) -> Wallet {
+        let master_key = Xpriv::new_master(bitcoin::Network::Regtest, &[42; 32]).unwrap();
+        let enc_material = KeyMaterial::new_from_password(Some(PASSWORD.to_string())).unwrap();
+        let store = WalletStore::init(
+            "timelock-reconcile-test".to_string(),
+            path,
+            bitcoin::Network::Regtest,
+            master_key,
+            None,
+            &enc_material,
+        )
+        .unwrap();
+        Wallet {
+            blockchain,
+            wallet_file_path: path.to_path_buf(),
+            store,
+            store_enc_material: enc_material,
+            new_mnemonic: None,
+            locked_utxos: HashSet::new(),
+            restore_scan: false,
+        }
+    }
+
+    /// Fails the pass instead of hanging if the stub cannot satisfy a sync:
+    /// `sync_no_fail` retries forever until shutdown.
+    fn shutdown_after(secs: u64) -> Arc<AtomicBool> {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let flag = shutdown.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(secs));
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        });
+        shutdown
+    }
+
+    /// Runs two recovery passes over a wallet holding `coin` and checks the
+    /// first records `recovery` as resolved, persists the removal, and the
+    /// second finds nothing.
+    fn assert_reconciles(
+        wallet: Wallet,
+        chain: &AnyBlockchain,
+        coin: &OutgoingSwapCoin,
+        recovery: &Transaction,
+    ) {
+        let wallet_path = wallet.wallet_file_path.clone();
+        let wallet = RwLock::new(wallet);
+        let shutdown = shutdown_after(60);
+        let contract_txid = coin.contract_tx.compute_txid();
+
+        let first =
+            Wallet::recover_timelocked_swapcoins(&wallet, chain, &shutdown, None, &|_| true)
+                .unwrap();
+        assert_eq!(
+            first.resolved,
+            vec![(contract_txid, recovery.compute_txid())]
+        );
+        assert!(first.discarded.is_empty());
+        assert!(wallet.read().unwrap().store.outgoing_swapcoins.is_empty());
+
+        let (reloaded, _) =
+            WalletStore::read_from_disk(&wallet_path, Some(PASSWORD.to_string())).unwrap();
+        assert!(reloaded.outgoing_swapcoins.is_empty());
+
+        let second =
+            Wallet::recover_timelocked_swapcoins(&wallet, chain, &shutdown, None, &|_| true)
+                .unwrap();
+        assert!(second.is_empty());
+    }
+
+    #[test]
+    fn electrum_records_our_confirmed_recovery_as_resolved() {
+        let (coin, recovery) = legacy_coin_and_recovery();
+        let url = start_electrum_stub(coin.contract_tx.clone(), recovery.clone());
+        let temp_dir = tempdir().unwrap();
+        let mut wallet = stub_wallet(&temp_dir.path().join("wallet.cbor"), electrum(&url));
+        wallet.add_outgoing_swapcoin(&coin);
+        wallet.save_to_disk().unwrap();
+
+        assert_reconciles(wallet, &electrum(&url), &coin, &recovery);
+    }
+
+    /// Electrum can list a replaced, never-mined recovery ahead of the one that
+    /// confirmed. Classifying from it would record the wrong txid, so the coin
+    /// waits for a later pass instead.
+    #[test]
+    fn electrum_waits_when_history_lists_an_unconfirmed_spend_first() {
+        let (coin, recovery, replaced) = legacy_coin_and_recoveries();
+        let url = start_electrum_stub_with(coin.contract_tx.clone(), recovery, Some(replaced));
+        let state =
+            Wallet::ensure_contract_on_chain(&electrum(&url), "swap", &coin, &|_| true).unwrap();
+        assert_eq!(state, ContractChainState::NotYet);
+    }
+
+    /// Hand-rolled Bitcoin Core JSON-RPC over HTTP: the contract is mined at
+    /// `CONTRACT_HEIGHT`, our recovery at `RECOVERY_HEIGHT`, and the contract
+    /// output is spent. Only the calls classification makes are answered.
+    fn start_core_stub(contract: Transaction, recovery: Transaction) -> String {
+        use std::io::Read;
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let addr = listener.local_addr().unwrap().to_string();
+        let header = bitcoin::constants::genesis_block(bitcoin::Network::Regtest).header;
+        let block_hash = |height: i64| BlockHash::from_byte_array([height as u8; 32]);
+        let mined = Arc::new(HashMap::from([
+            (contract.compute_txid(), (contract.clone(), CONTRACT_HEIGHT)),
+            (recovery.compute_txid(), (recovery.clone(), RECOVERY_HEIGHT)),
+        ]));
+
+        let answer = move |method: &str, params: &Value| -> Result<Value, Value> {
+            let unknown =
+                || json!({"code": -5, "message": "No such mempool or blockchain transaction"});
+            Ok(match method {
+                "getblockcount" => json!(TIP),
+                "getblockhash" => json!(block_hash(params[0].as_i64().unwrap())),
+                "getblockheader" => {
+                    let hash = params[0].as_str().unwrap();
+                    let height = (0..=TIP)
+                        .find(|h| block_hash(*h).to_string() == hash)
+                        .ok_or_else(unknown)?;
+                    json!({
+                        "hash": hash, "confirmations": TIP - height + 1, "height": height,
+                        "version": 1, "merkleroot": header.merkle_root, "time": 0,
+                        "mediantime": 0, "nonce": 0, "bits": "207fffff", "difficulty": 1.0,
+                        "chainwork": "00", "nTx": 1,
+                    })
+                }
+                "getblock" => {
+                    let hash = params[0].as_str().unwrap();
+                    let txdata = mined
+                        .values()
+                        .filter(|(_, h)| block_hash(*h).to_string() == hash)
+                        .map(|(tx, _)| tx.clone())
+                        .collect();
+                    json!(serialize_hex(&bitcoin::Block { header, txdata }))
+                }
+                "getrawtransaction" => {
+                    let txid: Txid = params[0].as_str().unwrap().parse().unwrap();
+                    let (tx, height) = mined.get(&txid).ok_or_else(unknown)?;
+                    if !params[1].as_bool().unwrap_or(false) {
+                        json!(serialize_hex(tx))
+                    } else {
+                        let vin: Vec<Value> = tx
+                            .input
+                            .iter()
+                            .map(|i| {
+                                json!({
+                                    "txid": i.previous_output.txid,
+                                    "vout": i.previous_output.vout,
+                                    "scriptSig": {"asm": "", "hex": ""},
+                                    "sequence": i.sequence.0,
+                                })
+                            })
+                            .collect();
+                        let vout: Vec<Value> = tx
+                            .output
+                            .iter()
+                            .enumerate()
+                            .map(|(n, o)| {
+                                json!({
+                                    "value": o.value.to_btc(),
+                                    "n": n,
+                                    "scriptPubKey": {
+                                        "asm": "",
+                                        "hex": o.script_pubkey.to_hex_string(),
+                                        "type": null,
+                                    },
+                                })
+                            })
+                            .collect();
+                        json!({
+                            "hex": serialize_hex(tx), "txid": txid, "hash": tx.compute_wtxid(),
+                            "size": tx.total_size(), "vsize": tx.vsize(), "version": 2,
+                            "locktime": 0, "blockhash": block_hash(*height),
+                            "confirmations": TIP - height + 1, "vin": vin, "vout": vout,
+                        })
+                    }
+                }
+                // The contract output is spent, and not from the mempool.
+                "gettxout" => Value::Null,
+                "gettxspendingprevout" => {
+                    json!([{"txid": params[0][0]["txid"], "vout": params[0][0]["vout"]}])
+                }
+                other => panic!("core stub: unexpected call {}", other),
+            })
+        };
+        let answer = Arc::new(answer);
+
+        thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let Ok(stream) = incoming else { continue };
+                let answer = answer.clone();
+                thread::spawn(move || {
+                    let mut out = stream.try_clone().expect("clone stub stream");
+                    let mut reader = BufReader::new(stream);
+                    loop {
+                        let mut body_len = 0;
+                        let mut line = String::new();
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                                return;
+                            }
+                            if line.trim().is_empty() {
+                                break;
+                            }
+                            if let Some(n) = line.to_lowercase().strip_prefix("content-length:") {
+                                body_len = n.trim().parse().unwrap();
+                            }
+                        }
+                        let mut body = vec![0; body_len];
+                        if reader.read_exact(&mut body).is_err() {
+                            return;
+                        }
+                        let req: Value = serde_json::from_slice(&body).unwrap();
+                        let (result, error) =
+                            match answer(req["method"].as_str().unwrap(), &req["params"]) {
+                                Ok(result) => (result, Value::Null),
+                                Err(error) => (Value::Null, error),
+                            };
+                        let reply = json!({
+                            "jsonrpc": "2.0", "id": req["id"], "result": result, "error": error,
+                        })
+                        .to_string();
+                        let written = write!(
+                            out,
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{reply}",
+                            reply.len()
+                        );
+                        if written.and_then(|_| out.flush()).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn core_classifies_our_confirmed_recovery_as_recovered() {
+        let (coin, recovery) = legacy_coin_and_recovery();
+        let url = start_core_stub(coin.contract_tx.clone(), recovery.clone());
+        let core = AnyBlockchain::CoreRPC(
+            crate::wallet::CoreRPC::new(&crate::wallet::CoreRpcConfig {
+                url,
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        let state = Wallet::ensure_contract_on_chain(&core, "swap", &coin, &|_| true).unwrap();
+        assert_eq!(
+            state,
+            ContractChainState::RecoveredByTimelock(recovery.compute_txid())
+        );
     }
 }
 
