@@ -1030,7 +1030,16 @@ impl Wallet {
                 // 1. Funding transaction inputs were confirmed spent elsewhere, so funding
                 //    can never confirm.
                 // 2. Funding transaction is unknown to the mempool/chain, all its wallet
-                //    inputs are still unspent, and it was never shared with the peer.
+                //    inputs are still unspent, it was never shared with the peer, and
+                //    the maker never signed our contract.
+                //
+                // An unknown tx with unspent inputs alone does not prove it was never
+                // broadcast: an evicted tx can still confirm from another node's
+                // mempool. The missing maker signature does. The taker persists that
+                // signature before broadcasting funding (`exchange_legacy`), so a coin
+                // the maker never signed was never broadcast by us, and unshared
+                // means no peer holds the signed funding tx either.
+                let maker_never_signed = swapcoin.others_contract_sig.is_none();
                 if let Some(ref funding_tx) = swapcoin.funding_tx {
                     let funding_txid = funding_tx.compute_txid();
                     let funding_confirmed = chain.tx_block_height(&funding_txid)?.is_some();
@@ -1048,12 +1057,13 @@ impl Wallet {
                         }
 
                         let funding_unknown = chain.is_tx_unknown(&funding_txid)?;
-                        if funding_unknown
+                        if maker_never_signed
+                            && funding_unknown
                             && all_unspent
                             && !funding_shared_with_peer(swapcoin.swap_id.as_deref())
                         {
                             log::info!(
-                                "Contract tx for {} cannot be signed, funding tx is unknown, wallet inputs are unspent, and funding was never shared — discarding swapcoin",
+                                "Contract tx for {} was never signed by the maker, funding tx is unknown, wallet inputs are unspent, and funding was never shared — discarding swapcoin",
                                 swap_id
                             );
                             return Ok(ContractChainState::Discarded);
@@ -1100,12 +1110,13 @@ impl Wallet {
                                 }
 
                                 let parent_unknown = chain.is_tx_unknown(&input_outpoint.txid)?;
-                                if parent_unknown
+                                if maker_never_signed
+                                    && parent_unknown
                                     && all_unspent
                                     && !funding_shared_with_peer(swapcoin.swap_id.as_deref())
                                 {
                                     log::info!(
-                                        "Contract tx for {} cannot be signed, parent tx is unknown, wallet inputs are unspent, and funding was never shared — discarding swapcoin",
+                                        "Contract tx for {} was never signed by the maker, parent tx is unknown, wallet inputs are unspent, and funding was never shared — discarding swapcoin",
                                         swap_id
                                     );
                                     return Ok(ContractChainState::Discarded);
@@ -5445,6 +5456,54 @@ mod legacy_recovery_tests {
                     true
                 })
                 .unwrap();
+            assert_eq!(res, ContractChainState::NotYet);
+        });
+    }
+
+    /// A coin the maker signed may have had its funding broadcast, and an
+    /// evicted funding tx can still confirm elsewhere. Unknown funding with
+    /// unspent inputs is no proof otherwise, so it must be kept even when the
+    /// contract still cannot be signed for another reason.
+    #[test]
+    fn test_ensure_contract_maker_signed_legacy_with_unknown_funding_is_not_yet() {
+        let parent_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![],
+            output: vec![TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51, 0x20, 0x01]),
+            }],
+        };
+        let parent_txid = parent_tx.compute_txid();
+
+        let funding_tx = Transaction {
+            version: bitcoin::transaction::Version::TWO,
+            lock_time: bitcoin::locktime::absolute::LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint::new(parent_txid, 0),
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(50_000),
+                script_pubkey: ScriptBuf::new(),
+            }],
+        };
+
+        let mut sc = make_legacy_outgoing_swapcoin(Some(funding_tx));
+        let secp = bitcoin::secp256k1::Secp256k1::new();
+        let msg = bitcoin::secp256k1::Message::from_digest([1u8; 32]);
+        sc.others_contract_sig = Some(bitcoin::ecdsa::Signature::sighash_all(
+            secp.sign_ecdsa(&msg, &SecretKey::from_slice(&[3u8; 32]).unwrap()),
+        ));
+        // Signing still fails, so the coin takes the unsignable path.
+        sc.other_pubkey = None;
+        for_both_backends(vec![(parent_tx, Some(10), true)], |blockchain| {
+            let res =
+                Wallet::ensure_contract_on_chain(&blockchain, "swap-maker-signed", &sc, &|_| false)
+                    .unwrap();
             assert_eq!(res, ContractChainState::NotYet);
         });
     }
