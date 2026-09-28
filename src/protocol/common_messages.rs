@@ -88,14 +88,8 @@ impl Offer {
     /// Checks the parts of an offer that are wrong whatever the swap amount is.
     /// A maker that fails this has published something nobody can price.
     pub(crate) fn validate_shape(&self) -> Result<(), String> {
-        for (name, pct) in [
-            ("amount_relative_fee_pct", self.amount_relative_fee_pct),
-            ("time_relative_fee_pct", self.time_relative_fee_pct),
-        ] {
-            if !pct.is_finite() || !(0.0..100.0).contains(&pct) {
-                return Err(format!("offer has invalid {name}: {pct}"));
-            }
-        }
+        check_fee_pcts(self.amount_relative_fee_pct, self.time_relative_fee_pct)
+            .map_err(|e| format!("offer has {e}"))?;
 
         if self.min_size > self.max_size {
             return Err(format!(
@@ -106,6 +100,23 @@ impl Offer {
 
         check_maker_name(&self.name)
     }
+}
+
+/// Fee percentages must be finite and in `0..100`. Takers refuse offers
+/// outside this, so makers refuse to start with them.
+pub(crate) fn check_fee_pcts(
+    amount_relative_fee_pct: f64,
+    time_relative_fee_pct: f64,
+) -> Result<(), String> {
+    for (name, pct) in [
+        ("amount_relative_fee_pct", amount_relative_fee_pct),
+        ("time_relative_fee_pct", time_relative_fee_pct),
+    ] {
+        if !pct.is_finite() || !(0.0..100.0).contains(&pct) {
+            return Err(format!("invalid {name}: {pct}"));
+        }
+    }
+    Ok(())
 }
 
 /// Longest maker name, in characters, that takers accept.

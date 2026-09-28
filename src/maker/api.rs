@@ -23,8 +23,8 @@ use crate::{
     lock_debug,
     maker::nostr::NOSTR_RELAYS,
     protocol::common_messages::{
-        check_maker_name, FidelityProof, MakerToTakerMessage, PrivateKeyHandover, ProtocolVersion,
-        SwapDetails, MAX_MAKER_NAME_LEN,
+        check_fee_pcts, check_maker_name, FidelityProof, MakerToTakerMessage, PrivateKeyHandover,
+        ProtocolVersion, SwapDetails, MAX_MAKER_NAME_LEN,
     },
     taker::api::{REFUND_LOCKTIME_BASE, REFUND_LOCKTIME_STEP},
     utill::{
@@ -368,18 +368,23 @@ impl MakerServerConfig {
         let name = parse_field(config_map.get("name"), default_config.name);
         check_maker_name(&name).map_err(WalletError::General)?;
 
+        let amount_relative_fee_pct = parse_field(
+            config_map.get("amount_relative_fee_pct"),
+            default_config.amount_relative_fee_pct,
+        );
+        let time_relative_fee_pct = parse_field(
+            config_map.get("time_relative_fee_pct"),
+            default_config.time_relative_fee_pct,
+        );
+        check_fee_pcts(amount_relative_fee_pct, time_relative_fee_pct)
+            .map_err(WalletError::General)?;
+
         Ok(MakerServerConfig {
             network_port: parse_field(config_map.get("network_port"), default_config.network_port),
             rpc_port: parse_field(config_map.get("rpc_port"), default_config.rpc_port),
             base_fee: parse_field(config_map.get("base_fee"), default_config.base_fee),
-            amount_relative_fee_pct: parse_field(
-                config_map.get("amount_relative_fee_pct"),
-                default_config.amount_relative_fee_pct,
-            ),
-            time_relative_fee_pct: parse_field(
-                config_map.get("time_relative_fee_pct"),
-                default_config.time_relative_fee_pct,
-            ),
+            amount_relative_fee_pct,
+            time_relative_fee_pct,
             required_confirms: parse_field(
                 config_map.get("required_confirms"),
                 default_config.required_confirms,
@@ -689,6 +694,9 @@ impl MakerServer {
     /// Initialize a maker server. The backend (Bitcoin Core or Electrum) is
     /// resolved from `config` via [`MakerServerConfig::backend`].
     pub fn init(mut config: MakerServerConfig) -> Result<Self, MakerError> {
+        // Configs built in code skip `MakerServerConfig::new`, so check here too.
+        check_fee_pcts(config.amount_relative_fee_pct, config.time_relative_fee_pct)
+            .map_err(|e| MakerError::Wallet(WalletError::General(e)))?;
         std::fs::create_dir_all(&config.data_dir).map_err(MakerError::IO)?;
         // For the Core backend, bind the node-side wallet name to the on-disk
         // wallet name (no-op for Electrum, which has no server-side wallet).
@@ -2963,12 +2971,13 @@ impl MakerRpc for MakerServer {
 #[cfg(test)]
 mod tests {
     use super::{
-        min_swap_amount, swap_cost_floor, MakerServerConfig, ShutdownSignal, ThreadPool,
-        MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
+        min_swap_amount, swap_cost_floor, MakerError, MakerServer, MakerServerConfig,
+        ShutdownSignal, ThreadPool, MIN_SWAP_STEP_SATS, REFUND_LOCKTIME_BASE,
     };
     use crate::{
         protocol::{contract::calculate_swap_fee, ProtocolVersion},
         utill::MIN_RELAY_FEE_RATE,
+        wallet::WalletError,
     };
     use std::{
         sync::{atomic::Ordering, mpsc, Arc, TryLockError},
@@ -2978,7 +2987,8 @@ mod tests {
 
     /// Non-finite or below-minimum fidelity feerates clamp to the relay
     /// minimum; a valid value is kept. A plain `<` comparison would let
-    /// `nan` through into the bond fee math. A name takers would refuse stops startup.
+    /// `nan` through into the bond fee math. A name or fee percentage takers
+    /// would refuse stops startup.
     #[test]
     fn maker_config_checks_file_values() {
         // The accepted timelock range depends on the integration-test
@@ -3020,6 +3030,54 @@ mod tests {
             .unwrap();
             assert_eq!(MakerServerConfig::new(Some(&path)).is_ok(), accepted);
         }
+
+        // Fee percentages follow the rule takers apply to offers.
+        for field in ["amount_relative_fee_pct", "time_relative_fee_pct"] {
+            for (pct, accepted) in [
+                ("0.0", true),
+                ("99.9", true),
+                ("-0.01", false),
+                ("100.0", false),
+                ("nan", false),
+                ("inf", false),
+            ] {
+                std::fs::write(
+                    &path,
+                    format!("fidelity_timelock = {timelock}\n{field} = {pct}\n"),
+                )
+                .unwrap();
+                assert_eq!(
+                    MakerServerConfig::new(Some(&path)).is_ok(),
+                    accepted,
+                    "{field} = {pct}"
+                );
+            }
+        }
+    }
+
+    /// A config built in code never goes through `MakerServerConfig::new`,
+    /// so `init` must refuse a bad fee percentage before touching the backend.
+    #[test]
+    fn maker_init_refuses_bad_fee_pcts() {
+        let dir = bitcoind::tempfile::tempdir().unwrap();
+        for (amount_pct, time_pct) in [(1.0, -0.01), (-1.0, 0.0), (f64::NAN, 0.0), (0.0, 100.0)] {
+            let config = MakerServerConfig {
+                data_dir: dir.path().join("maker"),
+                amount_relative_fee_pct: amount_pct,
+                time_relative_fee_pct: time_pct,
+                ..Default::default()
+            };
+            assert!(
+                matches!(
+                    MakerServer::init(config),
+                    Err(MakerError::Wallet(WalletError::General(_)))
+                ),
+                "{}, {}",
+                amount_pct,
+                time_pct
+            );
+        }
+        assert!(!dir.path().join("maker").exists());
     }
 
     #[test]
