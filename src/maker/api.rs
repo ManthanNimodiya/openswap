@@ -3053,6 +3053,17 @@ mod tests {
                 );
             }
         }
+        // A negative component is refused even when the sum stays positive.
+        std::fs::write(
+            &path,
+            format!(
+                "fidelity_timelock = {timelock}\n\
+                 amount_relative_fee_pct = 1.0\n\
+                 time_relative_fee_pct = -0.01\n"
+            ),
+        )
+        .unwrap();
+        assert!(MakerServerConfig::new(Some(&path)).is_err());
     }
 
     /// A config built in code never goes through `MakerServerConfig::new`,
