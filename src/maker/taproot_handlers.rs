@@ -377,6 +377,9 @@ fn process_taproot_contract<M: Maker>(
         .iter()
         .map(|params| params.5.clone())
         .collect();
+    // Held from the coin claim through the last stored state: a reconnect
+    // running this handler at the same time would build a second batch.
+    let _funding = maker.begin_funding(&data.id)?;
     let (contract_txs, output_positions) = maker.create_funding_transactions(
         &data.id,
         forwardable,
