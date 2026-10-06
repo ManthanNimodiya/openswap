@@ -2089,7 +2089,10 @@ pub fn bind_port_retry(port: u16) -> Result<(TcpListener, u16), MakerError> {
 
     while current_port < MAX_PORT {
         match TcpListener::bind((Ipv4Addr::LOCALHOST, current_port)) {
-            Ok(l) => return Ok((l, current_port)),
+            Ok(l) => {
+                let bound_port = l.local_addr().map_err(MakerError::IO)?.port();
+                return Ok((l, bound_port));
+            }
             Err(e) if e.kind() == ErrorKind::AddrInUse => {
                 log::info!("Port {} in use, trying {}", current_port, current_port + 2);
                 current_port += 2
