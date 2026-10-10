@@ -208,8 +208,8 @@ fn encwallet_encbackup_encrestore() {
     cleanup(&mut bitcoind, &root_dir);
 }
 
-/// Every used receive address is spent to empty, so the restore finds no coins.
-/// It must still resume past them, from their history, not hand out `m/0/0` again.
+/// Every used address, receive and change, both types, is spent to empty, so the
+/// restore finds no coins. It must still resume past them from their history.
 #[test]
 fn core_restore_skips_emptied_receive_addresses() {
     let (original_wallet, rpc_config, backup_file, mut bitcoind, restored_wallet_file, root_dir) =
@@ -224,16 +224,24 @@ fn core_restore_skips_emptied_receive_addresses() {
     .unwrap();
     wallet.backup(&backup_file, km.clone()).unwrap();
 
-    for _ in 0..2 {
-        let addr = wallet
-            .get_next_external_address(AddressType::P2WPKH)
-            .unwrap();
+    for address_type in [
+        AddressType::P2WPKH,
+        AddressType::P2WPKH,
+        AddressType::P2TR,
+        AddressType::P2TR,
+    ] {
+        let addr = wallet.get_next_external_address(address_type).unwrap();
         send_and_mine(&mut bitcoind, &addr, 0.05, 1).unwrap();
     }
+    let change = wallet
+        .get_next_internal_addresses(1, AddressType::P2TR)
+        .unwrap()
+        .remove(0);
+    send_and_mine(&mut bitcoind, &change, 0.05, 1).unwrap();
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
 
     let coins = wallet.list_descriptor_utxo_spend_info();
-    assert_eq!(coins.len(), 2);
+    assert_eq!(coins.len(), 5);
     let sink = bitcoind
         .client
         .get_new_address(None, None)
@@ -246,14 +254,14 @@ fn core_restore_skips_emptied_receive_addresses() {
     generate_blocks(&bitcoind, 1);
     wallet.sync_and_save(&openswap::utill::NO_SHUTDOWN).unwrap();
     assert!(wallet.list_descriptor_utxo_spend_info().is_empty());
-    assert_eq!(*wallet.get_external_index(), 2);
+    assert_eq!(*wallet.get_external_index(), 4);
 
     let (backup, _) = load_sensitive_struct::<WalletBackup, SerdeJson>(
         &backup_file,
         Some("integration-test".into()),
     )
     .unwrap();
-    let restored = Wallet::restore(
+    let mut restored = Wallet::restore(
         &backup,
         &restored_wallet_file,
         &BackendConfig::CoreRpc(rpc_config.clone()),
@@ -261,7 +269,13 @@ fn core_restore_skips_emptied_receive_addresses() {
     )
     .unwrap();
 
-    assert_eq!(*restored.get_external_index(), 2);
+    assert_eq!(*restored.get_external_index(), 4);
+    let next_change = |w: &mut Wallet| {
+        w.get_next_internal_addresses(1, AddressType::P2TR)
+            .unwrap()
+            .remove(0)
+    };
+    assert_eq!(next_change(&mut restored), next_change(&mut wallet));
 
     cleanup(&mut bitcoind, &root_dir);
 }
