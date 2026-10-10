@@ -82,6 +82,9 @@ pub enum MakerBehavior {
     CloseAtReqContractSigsForSender,
     /// Close connection when receiving ProofOfFunding (abort2 scenario).
     CloseAtProofOfFunding,
+    /// Hold each funding step open long enough for a test to race a
+    /// duplicate of its message in on a second connection.
+    PauseInFundingStep,
     /// Close connection when receiving RespContractSigsForRecvrAndSender (abort3 scenario).
     CloseAtContractSigsForRecvrAndSender,
     /// Close connection when receiving ReqContractSigsForRecvr (abort3 scenario).
@@ -333,6 +336,16 @@ impl ConnectionState {
             }
         }
         Ok(())
+    }
+}
+
+/// Called beside, not inside, each funding guard, so a test that drops the
+/// guard still has the window open for the duplicate to slip through.
+#[cfg(feature = "integration-test")]
+pub(crate) fn pause_in_funding_step<M: Maker>(maker: &M) {
+    if maker.behavior() == MakerBehavior::PauseInFundingStep {
+        log::warn!("Test behavior: holding the funding step open");
+        std::thread::sleep(std::time::Duration::from_secs(3));
     }
 }
 
