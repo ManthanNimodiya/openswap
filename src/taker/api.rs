@@ -2179,8 +2179,6 @@ impl Taker {
         }
     }
 
-    /// Send `details` to `maker_address` on a fresh connection and return the
-    /// maker's raw response, accept or reject.
     /// Whether this funding-step message should also be raced to `maker_address`.
     #[cfg(feature = "integration-test")]
     pub(crate) fn races_funding_step(&self, maker_address: &str) -> Result<bool, TakerError> {
@@ -2188,24 +2186,48 @@ impl Taker {
             && self.swap_state()?.makers[0].address.to_string() == maker_address)
     }
 
+    /// Waits until the maker has entered `swap_id`'s funding step more than
+    /// `entered` times, i.e. the copy just sent holds the guard.
+    #[cfg(feature = "integration-test")]
+    pub(crate) fn wait_for_funding_step(
+        &self,
+        swap_id: &str,
+        entered: usize,
+    ) -> Result<(), TakerError> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while crate::maker::handlers::funding_steps_entered(swap_id) <= entered {
+            if std::time::Instant::now() > deadline {
+                return Err(TakerError::General(
+                    "Maker never entered the funding step".to_string(),
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        Ok(())
+    }
+
     /// Sends a Legacy funding-step message again on a second connection, once
-    /// the maker is inside the first copy's funding step.
+    /// the first copy holds the maker's funding step.
     #[cfg(feature = "integration-test")]
     pub(crate) fn race_legacy_funding_step(
         &self,
         maker_address: &str,
+        swap_id: &str,
+        entered: usize,
         msg: &TakerToMakerMessage,
     ) -> Result<(), TakerError> {
         if !self.races_funding_step(maker_address)? {
             return Ok(());
         }
-        std::thread::sleep(Duration::from_secs(1));
+        self.wait_for_funding_step(swap_id, entered)?;
         log::warn!("Test behavior: racing a duplicate funding-step message to {maker_address}");
         let mut stream = self.net_connect(maker_address)?;
         send_message(&mut stream, msg)?;
         Ok(())
     }
 
+    /// Send `details` to `maker_address` on a fresh connection and return the
+    /// maker's raw response, accept or reject.
     pub(crate) fn resend_swap_details(
         &self,
         maker_address: &str,

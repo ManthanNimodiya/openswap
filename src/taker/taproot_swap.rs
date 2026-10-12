@@ -378,6 +378,8 @@ impl Taker {
                 ));
             }
 
+            #[cfg(feature = "integration-test")]
+            let entered = crate::maker::handlers::funding_steps_entered(&contract_data.id);
             send_message(
                 &mut stream,
                 &TakerToMakerMessage::TaprootContractData(Box::new(contract_data.clone())),
@@ -388,7 +390,7 @@ impl Taker {
 
             #[cfg(feature = "integration-test")]
             if self.races_funding_step(&maker_address)? {
-                std::thread::sleep(std::time::Duration::from_secs(1));
+                self.wait_for_funding_step(&contract_data.id, entered)?;
                 log::warn!("Test behavior: racing duplicate contract data to maker {i}");
                 if self
                     .resume_contract_data_exchange(&maker_address, i, &contract_data)

@@ -1322,9 +1322,11 @@ impl Taker {
         };
 
         let msg = TakerToMakerMessage::ProofOfFunding(pof);
+        #[cfg(feature = "integration-test")]
+        let entered = crate::maker::handlers::funding_steps_entered(swap_id);
         send_message(&mut stream, &msg)?;
         #[cfg(feature = "integration-test")]
-        self.race_legacy_funding_step(maker_address, &msg)?;
+        self.race_legacy_funding_step(maker_address, swap_id, entered, &msg)?;
 
         let msg_bytes = read_message(&mut stream)?;
         let msg: MakerToTakerMessage = serde_cbor::from_slice(&msg_bytes)?;
@@ -1392,9 +1394,11 @@ impl Taker {
         };
 
         let msg = TakerToMakerMessage::RespContractSigsForRecvrAndSender(resp);
+        #[cfg(feature = "integration-test")]
+        let entered = crate::maker::handlers::funding_steps_entered(swap_id);
         send_message(&mut stream, &msg)?;
         #[cfg(feature = "integration-test")]
-        self.race_legacy_funding_step(maker_address, &msg)?;
+        self.race_legacy_funding_step(maker_address, swap_id, entered, &msg)?;
 
         log::info!(
             "Sent RespContractSigsForRecvrAndSender for swap {}",

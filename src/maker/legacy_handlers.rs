@@ -342,6 +342,11 @@ fn process_proof_of_funding<M: Maker>(
         .iter()
         .map(|sc| sc.contract_tx.compute_txid())
         .collect();
+    // Held from the claim through the stored state: a reconnect resending
+    // ProofOfFunding meanwhile is refused instead of building a second batch.
+    let _funding = maker.begin_funding(&pof.id)?;
+    #[cfg(feature = "integration-test")]
+    super::handlers::pause_in_funding_step(maker.as_ref(), &pof.id);
     maker.claim_incoming_contract_txids(&pof.id, &incoming_txids)?;
 
     let hashvalue = maker.verify_proof_of_funding(&pof)?;
@@ -419,12 +424,6 @@ fn process_proof_of_funding<M: Maker>(
         sweep_fee,
         forwardable
     );
-
-    // Held through the stored state: a reconnect resending ProofOfFunding at
-    // the same time would build a second batch for this swap.
-    let _funding = maker.begin_funding(&pof.id)?;
-    #[cfg(feature = "integration-test")]
-    super::handlers::pause_in_funding_step(maker.as_ref());
 
     // Sync wallet before creating outgoing swaps to get fresh UTXO state.
     log::info!(
@@ -619,7 +618,7 @@ fn process_resp_contract_sigs_for_recvr_and_sender<M: Maker>(
     // The broadcast below must not race a resent ProofOfFunding rebuilding the batch.
     let _funding = maker.begin_funding(&resp.id)?;
     #[cfg(feature = "integration-test")]
-    super::handlers::pause_in_funding_step(maker.as_ref());
+    super::handlers::pause_in_funding_step(maker.as_ref(), &resp.id);
 
     // The sync, persistence and broadcast loop below can outlive the idle
     // timeout; refresh the stored activity so the idle checker does not drain

@@ -200,6 +200,11 @@ fn process_taproot_contract<M: Maker>(
         .iter()
         .map(|tx| tx.compute_txid())
         .collect();
+    // Held from the claim through the last stored state: a reconnect running
+    // this handler meanwhile is refused instead of building a second batch.
+    let _funding = maker.begin_funding(&data.id)?;
+    #[cfg(feature = "integration-test")]
+    super::handlers::pause_in_funding_step(maker.as_ref(), &data.id);
     maker.claim_incoming_contract_txids(&data.id, &incoming_txids)?;
     // A mempool-only contract may be replaced via RBF after we fund the next hop,
     // so require confirmations before proceeding. One wait for the whole batch:
@@ -377,11 +382,6 @@ fn process_taproot_contract<M: Maker>(
         .iter()
         .map(|params| params.5.clone())
         .collect();
-    // Held from the coin claim through the last stored state: a reconnect
-    // running this handler at the same time would build a second batch.
-    let _funding = maker.begin_funding(&data.id)?;
-    #[cfg(feature = "integration-test")]
-    super::handlers::pause_in_funding_step(maker.as_ref());
     let (contract_txs, output_positions) = maker.create_funding_transactions(
         &data.id,
         forwardable,
