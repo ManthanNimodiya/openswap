@@ -339,10 +339,10 @@ impl ConnectionState {
     }
 }
 
-/// Funding steps entered per swap id, so a test can send its duplicate only
-/// once the first handler holds the guard.
+/// Funding steps entered per swap id, so a race test can wait for the guard.
 #[cfg(feature = "integration-test")]
-static FUNDING_STEPS_ENTERED: Mutex<Vec<String>> = Mutex::new(Vec::new());
+static FUNDING_STEPS_ENTERED: Mutex<Option<std::collections::HashMap<String, usize>>> =
+    Mutex::new(None);
 
 /// How many times a handler has entered `swap_id`'s funding step.
 #[cfg(feature = "integration-test")]
@@ -350,9 +350,9 @@ pub(crate) fn funding_steps_entered(swap_id: &str) -> usize {
     FUNDING_STEPS_ENTERED
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
-        .iter()
-        .filter(|id| *id == swap_id)
-        .count()
+        .as_ref()
+        .and_then(|steps| steps.get(swap_id).copied())
+        .unwrap_or(0)
 }
 
 /// Called beside, not inside, each funding guard, so a test that drops the
@@ -361,10 +361,12 @@ pub(crate) fn funding_steps_entered(swap_id: &str) -> usize {
 pub(crate) fn pause_in_funding_step<M: Maker>(maker: &M, swap_id: &str) {
     if maker.behavior() == MakerBehavior::PauseInFundingStep {
         log::warn!("Test behavior: holding the funding step open");
-        FUNDING_STEPS_ENTERED
+        *FUNDING_STEPS_ENTERED
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(swap_id.to_string());
+            .get_or_insert_with(Default::default)
+            .entry(swap_id.to_string())
+            .or_default() += 1;
         std::thread::sleep(std::time::Duration::from_secs(3));
     }
 }
