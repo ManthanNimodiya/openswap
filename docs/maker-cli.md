@@ -46,7 +46,7 @@ Commands:
   list-utxo-swap      Lists utxos received from incoming swaps
   list-utxo-contract  Lists HTLC contract utxos
   list-utxo-fidelity  Lists fidelity bond utxos
-  get-balances        Get total wallet balances of different categories. regular: All single signature regular wallet coins (seed balance). swap: All 2of2 multisig coins received in swaps. contract: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or malfinished swaps. You can claim them back with the recover command. fidelity: All coins locked in fidelity bonds. spendable: Spendable amount in wallet (regular + swap balance)
+  get-balances        Get total wallet balances of different categories. regular: All single signature regular wallet coins (seed balance). swap: All 2of2 multisig coins received in swaps. contract: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or malfinished swaps. makerd recovers them on its own. fidelity: All coins locked in fidelity bonds. spendable: Spendable amount in wallet (regular + swap balance)
   get-new-address     Gets a new bitcoin receiving address
   send-to-address     Send Bitcoin to an external address and return the txid
   show-tor-address    Show the server tor address

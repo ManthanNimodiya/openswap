@@ -60,7 +60,8 @@ struct Cli {
 
     /// Electrum server URL (e.g. `tcp://localhost:50001`). When set, the wallet
     /// is initialised against an Electrum backend instead of Bitcoin Core.
-    /// Mutually exclusive with the Bitcoin Core flags (--rpc/--zmq/--auth).
+    /// Mutually exclusive with the Bitcoin Core flags (-r/--ADDRESS:PORT, -z/--ZMQ,
+    /// -a/--USER:PASSWORD).
     /// Electrum servers do not serve full blocks, so chain-based fidelity-bond
     /// discovery is unavailable — maker discovery relies on nostr relays only.
     #[clap(
@@ -188,7 +189,8 @@ enum Commands {
         /// Protocol version to use: "legacy" or "taproot"
         #[clap(long, default_value = "legacy")]
         protocol: String,
-        /// Manually specify maker addresses (host:port). Can be repeated.
+        /// Manually specify maker addresses: the bare onion host, as the port is
+        /// fixed. Can be repeated.
         /// When set, these makers are used directly instead of auto-discovery.
         #[clap(long = "maker-address")]
         maker_addresses: Vec<String>,

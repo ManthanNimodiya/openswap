@@ -44,7 +44,7 @@ enum Commands {
     /// Get total wallet balances of different categories.
     /// regular: All single signature regular wallet coins (seed balance).
     /// swap: All 2of2 multisig coins received in swaps.
-    /// contract: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or malfinished swaps. You can claim them back with the recover command.
+    /// contract: All live contract transaction balance locked in timelocks. If you see value in this field, you have unfinished or malfinished swaps. makerd recovers them on its own.
     /// fidelity: All coins locked in fidelity bonds.
     /// spendable: Spendable amount in wallet (regular + swap balance).
     GetBalances,

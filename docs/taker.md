@@ -95,7 +95,7 @@ Options:
           
 
       --electrum <ELECTRUM_URL>
-          Electrum server URL (e.g. `tcp://localhost:50001`). When set, the wallet is initialised against an Electrum backend instead of Bitcoin Core. Mutually exclusive with the Bitcoin Core flags (--rpc/--zmq/--auth). Electrum servers do not serve full blocks, so chain-based fidelity-bond discovery is unavailable — maker discovery relies on nostr relays only
+          Electrum server URL (e.g. `tcp://localhost:50001`). When set, the wallet is initialised against an Electrum backend instead of Bitcoin Core. Mutually exclusive with the Bitcoin Core flags (-r/--ADDRESS:PORT, -z/--ZMQ, -a/--USER:PASSWORD). Electrum servers do not serve full blocks, so chain-based fidelity-bond discovery is unavailable — maker discovery relies on nostr relays only
 
       --electrum-tor
           Route the Electrum backend through the Tor SOCKS proxy on `socks_port`. Works with an onion or a clearnet server; an onion URL needs it. Peer-to-peer Tor is unaffected either way
@@ -412,7 +412,7 @@ Options:
       --protocol <PROTOCOL>
           Protocol version to use: "legacy" or "taproot" [default: legacy]
       --maker-address <MAKER_ADDRESSES>
-          Manually specify maker addresses (host:port). Can be repeated. When set, these makers are used directly instead of auto-discovery
+          Manually specify maker addresses: the bare onion host, as the port is fixed. Can be repeated. When set, these makers are used directly instead of auto-discovery
       --auto-select
           Automatically select UTXOs instead of interactive picker
       --payment-address <PAYMENT_ADDRESS>

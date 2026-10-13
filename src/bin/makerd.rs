@@ -52,7 +52,8 @@ struct Cli {
     pub auth: (String, String),
     /// Electrum server URL (e.g. `tcp://localhost:50001`). When set, the wallet
     /// is initialised against an Electrum backend instead of Bitcoin Core.
-    /// Mutually exclusive with the Bitcoin Core flags (--rpc/--zmq/--auth).
+    /// Mutually exclusive with the Bitcoin Core flags (-r/--ADDRESS:PORT, -z/--ZMQ,
+    /// -a/--USER:PASSWORD).
     #[clap(
         name = "ELECTRUM_URL",
         long = "electrum",

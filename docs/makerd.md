@@ -178,7 +178,7 @@ Options:
           [default: user:password]
 
       --electrum <ELECTRUM_URL>
-          Electrum server URL (e.g. `tcp://localhost:50001`). When set, the wallet is initialised against an Electrum backend instead of Bitcoin Core. Mutually exclusive with the Bitcoin Core flags (--rpc/--zmq/--auth)
+          Electrum server URL (e.g. `tcp://localhost:50001`). When set, the wallet is initialised against an Electrum backend instead of Bitcoin Core. Mutually exclusive with the Bitcoin Core flags (-r/--ADDRESS:PORT, -z/--ZMQ, -a/--USER:PASSWORD)
 
       --electrum-tor
           Route the Electrum backend through the Tor SOCKS proxy on `socks_port`. Works with an onion or a clearnet server; an onion URL needs it. Peer-to-peer Tor is unaffected either way
