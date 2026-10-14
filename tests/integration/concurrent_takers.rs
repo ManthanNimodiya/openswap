@@ -383,23 +383,30 @@ fn test_concurrent_funding_race() {
             .with_preferred_makers(vec![maker_address.clone()])
     };
 
-    // Both admissions must succeed; only funding may race. The barrier then
-    // starts both swaps as close together as the framework allows.
+    // Both admissions must succeed; only funding may race. Admitting first,
+    // on this thread, means a failed admission panics here instead of
+    // stranding the other taker at the barrier. The maker claims coins only
+    // at funding, so both plans still draw the same inputs.
+    let swap_ids: Vec<String> = takers
+        .iter_mut()
+        .map(|taker| {
+            taker
+                .prepare_swap(swap_params())
+                .expect("both takers must be admitted before the race")
+                .swap_id
+        })
+        .collect();
     let start = Arc::new(Barrier::new(2));
     let results = [AtomicU8::new(RESULT_PENDING), AtomicU8::new(RESULT_PENDING)];
 
     thread::scope(|s| {
-        for (i, taker) in takers.iter_mut().enumerate() {
+        for (i, (taker, swap_id)) in takers.iter_mut().zip(&swap_ids).enumerate() {
             let barrier = start.clone();
             let result = &results[i];
-            let params = swap_params();
             s.spawn(move || {
-                let summary = taker
-                    .prepare_swap(params)
-                    .expect("both takers must be admitted before the race");
                 barrier.wait();
                 info!("Taker {} entering the funding race", i + 1);
-                let outcome = taker.start_swap(&summary.swap_id);
+                let outcome = taker.start_swap(swap_id);
                 match outcome {
                     Ok(report) => {
                         info!("Taker {} won the race: {:?}", i + 1, report);
