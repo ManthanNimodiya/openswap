@@ -136,16 +136,18 @@ fn fidelity_limit_violation() {
         Err(ref e) => {
             // Config loading itself failed with Fidelity error
             assert!(
-                matches!(e, WalletError::Fidelity(_)),
-                "Expected WalletError::Fidelity, got: {:?}",
+                matches!(e, WalletError::Fidelity(_))
+                    && format!("{e:?}").contains("InvalidBondLocktime"),
+                "Expected an invalid bond locktime, got: {:?}",
                 e
             );
             info!("Maker config rejected as expected: {:?}", e);
         }
         Ok(Err(ref e)) => {
             assert!(
-                matches!(e, MakerError::Wallet(WalletError::Fidelity(_))),
-                "Expected MakerError::Wallet(WalletError::Fidelity(_)), got: {:?}",
+                matches!(e, MakerError::Wallet(WalletError::Fidelity(_)))
+                    && format!("{e:?}").contains("InvalidBondLocktime"),
+                "Expected an invalid bond locktime, got: {:?}",
                 e
             );
             info!("Maker did not start as expected: {:?}", e);

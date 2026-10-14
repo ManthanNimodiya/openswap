@@ -696,16 +696,24 @@ fn test_manual_coinselection() {
                 }
             }
             (Err(e), "Error") => {
+                // Each error case names its own reason; any other error is a bug.
                 let error_msg = format!("{e:?}");
-                if selection_type == "R+S"
-                    && error_msg.contains("Cannot mix regular and swap UTXOs")
-                {
-                    println!("{test_name}: SUCCESS - Correctly rejected mixed UTXO selection");
-                } else if error_msg.contains("InsufficientFund") {
-                    println!("{test_name}: SUCCESS - Correctly failed with insufficient funds");
+                if selection_type == "R+S" {
+                    assert!(
+                        error_msg.contains("Cannot mix regular and swap UTXOs"),
+                        "{}: expected the mixed-selection refusal, got {}",
+                        test_name,
+                        error_msg
+                    );
                 } else {
-                    println!("{test_name}: SUCCESS - {error_msg}");
+                    assert!(
+                        matches!(e, WalletError::InsufficientFund { .. }),
+                        "{}: expected InsufficientFund, got {}",
+                        test_name,
+                        error_msg
+                    );
                 }
+                println!("{test_name}: SUCCESS - {error_msg}");
             }
             (Ok(_), "Error") => {
                 panic!(

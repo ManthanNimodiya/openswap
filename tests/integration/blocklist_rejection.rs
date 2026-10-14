@@ -237,6 +237,11 @@ fn run_maker_rejection(protocol: ProtocolVersion) {
         taker.start_swap(&summary.swap_id).is_err(),
         "the first maker must reject funding from the blocked source address"
     );
+    // The taker only sees the dropped connection; the maker's log names why.
+    test_framework.assert_log(
+        &format!("uses blocked address {blocked_address}"),
+        &test_framework.taker_log_path(),
+    );
 
     for (maker, spendable_before) in makers.iter().zip(maker_spendable_before) {
         maker

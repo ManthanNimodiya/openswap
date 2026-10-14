@@ -8,7 +8,7 @@ use bitcoin::Amount;
 use openswap::{
     maker::{start_server, MakerBehavior},
     protocol::common_messages::ProtocolVersion,
-    taker::{SwapParams, TakerBehavior},
+    taker::{error::TakerError, SwapParams, TakerBehavior},
 };
 
 use super::test_framework::*;
@@ -75,15 +75,15 @@ fn test_taproot_maker_abort1() {
     generate_blocks(bitcoind, 1);
 
     // prepare_swap should FAIL because only 1 maker is available for a 2-maker swap
-    let prepare_result = taker.prepare_swap(swap_params);
+    let err = taker.prepare_swap(swap_params).expect_err(
+        "prepare_swap should fail because only 1 maker is available for a 2-maker swap",
+    );
     assert!(
-        prepare_result.is_err(),
-        "prepare_swap should fail because only 1 maker is available for a 2-maker swap"
+        matches!(err, TakerError::NotEnoughMakersInOfferBook),
+        "Expected NotEnoughMakersInOfferBook, got: {:?}",
+        err
     );
-    info!(
-        "Prepare failed as expected: {:?}",
-        prepare_result.err().unwrap()
-    );
+    info!("Prepare failed as expected: {:?}", err);
 
     // Sync taker wallet and verify balance is unchanged
     taker

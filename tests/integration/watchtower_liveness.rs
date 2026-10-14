@@ -39,7 +39,15 @@ fn maker_rejects_new_swaps_after_watcher_exit() {
     maker.watch_service.stop_watcher_for_test();
     assert!(!maker.watch_service.is_alive());
 
-    for protocol in [ProtocolVersion::Legacy, ProtocolVersion::Taproot] {
+    // The taker only sees "rejected", so the maker's log names the reason.
+    let log_path = test_framework.taker_log_path();
+    let watcher_rejections = || {
+        std::fs::read_to_string(&log_path)
+            .unwrap()
+            .matches("because the watchtower is down")
+            .count()
+    };
+    for (protocol, expected) in [(ProtocolVersion::Legacy, 1), (ProtocolVersion::Taproot, 2)] {
         let result = taker.prepare_swap(
             SwapParams::new(protocol, Amount::from_sat(500_000), 1)
                 .with_tx_count(1)
@@ -53,6 +61,11 @@ fn maker_rejects_new_swaps_after_watcher_exit() {
             ),
             other => panic!("unexpected admission result: {:?}", other),
         }
+        assert_eq!(
+            watcher_rejections(),
+            expected,
+            "the {protocol:?} rejection must come from the dead watchtower"
+        );
     }
 
     drop(takers);

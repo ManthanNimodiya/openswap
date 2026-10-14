@@ -383,8 +383,8 @@ fn test_concurrent_funding_race() {
             .with_preferred_makers(vec![maker_address.clone()])
     };
 
-    // Barrier-start both takers: the tightest sequencing the framework
-    // offers, so both admissions plan over the same coins.
+    // Both admissions must succeed; only funding may race. The barrier then
+    // starts both swaps as close together as the framework allows.
     let start = Arc::new(Barrier::new(2));
     let results = [AtomicU8::new(RESULT_PENDING), AtomicU8::new(RESULT_PENDING)];
 
@@ -394,11 +394,12 @@ fn test_concurrent_funding_race() {
             let result = &results[i];
             let params = swap_params();
             s.spawn(move || {
-                barrier.wait();
-                info!("Taker {} entering the admission race", i + 1);
-                let outcome = taker
+                let summary = taker
                     .prepare_swap(params)
-                    .and_then(|summary| taker.start_swap(&summary.swap_id));
+                    .expect("both takers must be admitted before the race");
+                barrier.wait();
+                info!("Taker {} entering the funding race", i + 1);
+                let outcome = taker.start_swap(&summary.swap_id);
                 match outcome {
                     Ok(report) => {
                         info!("Taker {} won the race: {:?}", i + 1, report);

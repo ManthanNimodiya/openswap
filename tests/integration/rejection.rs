@@ -423,6 +423,32 @@ fn test_low_swap_liquidity() {
     let err = taker
         .prepare_swap(swap_params.clone())
         .expect_err("Swap should have failed due to insufficient maker liquidity");
+    assert!(
+        matches!(err, TakerError::NotEnoughMakersInOfferBook),
+        "Expected NotEnoughMakersInOfferBook, got: {:?}",
+        err
+    );
+    // The refusal must come from the drained maker: its max=0 offer cannot
+    // price any amount, so the offerbook sidelines it.
+    let maker_address = format!("127.0.0.1:{}", maker.config.network_port);
+    let drained = taker
+        .fetch_offers()
+        .unwrap()
+        .all_makers()
+        .into_iter()
+        .find(|candidate| candidate.address.to_string() == maker_address)
+        .expect("the drained maker must be in the offerbook");
+    assert!(
+        matches!(
+            drained.state,
+            MakerState::Unavailable(UnavailableState {
+                reason: UnavailableReason::UnpriceableOffer,
+                ..
+            })
+        ),
+        "the drained maker must be out for an unpriceable offer, got {:?}",
+        drained.state
+    );
     info!("OpenSwap failed as expected: {err:?}");
 
     info!("Adding sufficient funds to maker to perform a swap and avoid low swap liquidity");
