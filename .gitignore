@@ -1,7 +1,7 @@
 /target
 /tests/macros/target
 *.swp
-Cargo.lock
+/tests/macros/Cargo.lock
 .vscode
 .idea
 .ra-target
