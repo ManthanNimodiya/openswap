@@ -4,7 +4,7 @@
 //! turn. Tests that need an old connection held open, or a message the taker
 //! would never send at that moment, use this instead.
 
-use std::{net::TcpStream, time::Duration};
+use std::{io::ErrorKind, net::TcpStream, time::Duration};
 
 use openswap::{
     error::NetError,
@@ -58,6 +58,25 @@ impl RawMakerConnection {
     /// Sends one message.
     pub fn send(&mut self, message: &TakerToMakerMessage) {
         send_message(&mut self.stream, message).expect("send to maker");
+    }
+
+    /// Panics unless the maker closed the connection: a reply, a decode
+    /// error or a read timeout all mean it is still open.
+    pub fn expect_closed(&mut self) {
+        match self.recv() {
+            Err(NetError::ReachedEOF) => {}
+            Err(NetError::IO(e))
+                if matches!(
+                    e.kind(),
+                    ErrorKind::UnexpectedEof
+                        | ErrorKind::ConnectionReset
+                        | ErrorKind::ConnectionAborted
+                ) => {}
+            other => panic!(
+                "expected the maker to close the connection, got {:?}",
+                other
+            ),
+        }
     }
 
     /// Reads one reply. An error means the maker closed the connection or

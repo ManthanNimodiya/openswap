@@ -290,10 +290,7 @@ fn stale_connection_cannot_drive_a_readmitted_swap(world: &mut World) {
         next_openswap_info: vec![],
         refund_locktime: 150,
     }));
-    assert!(
-        stale.recv().is_err(),
-        "the maker must close the stale connection"
-    );
+    stale.expect_closed();
 
     let log = std::fs::read_to_string(&log_path).unwrap();
     let after = &log[offset..];
