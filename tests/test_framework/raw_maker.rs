@@ -8,8 +8,12 @@ use std::{io::ErrorKind, net::TcpStream, time::Duration};
 
 use openswap::{
     error::NetError,
-    protocol::common_messages::{
-        AckSwapDetails, GetOffer, MakerToTakerMessage, SwapDetails, TakerHello, TakerToMakerMessage,
+    protocol::{
+        common_messages::{
+            AckSwapDetails, GetOffer, Hello, MakerToTakerMessage, ProtocolVersion, SwapDetails,
+            TakerToMakerMessage,
+        },
+        features::{choose_pins, supported},
     },
     utill::{read_message, send_message},
 };
@@ -32,21 +36,29 @@ impl RawMakerConnection {
         Self { stream }
     }
 
-    /// Opens a connection and takes it through hello, offer and `details`.
+    /// Opens a connection and takes it through hello, offer and `details`,
+    /// pinning `protocol` from the maker's features as the taker would.
     /// Panics unless the maker accepts the swap.
-    pub fn admit(address: &str, details: &SwapDetails) -> (Self, AckSwapDetails) {
+    pub fn admit(
+        address: &str,
+        protocol: ProtocolVersion,
+        mut details: SwapDetails,
+    ) -> (Self, AckSwapDetails) {
         let mut conn = Self::connect(address);
-        conn.send(&TakerToMakerMessage::TakerHello(TakerHello));
-        match conn.recv() {
-            Ok(MakerToTakerMessage::MakerHello(_)) => {}
-            other => panic!("expected MakerHello, got {:?}", other),
-        }
+        conn.send(&TakerToMakerMessage::Hello(Hello {
+            features: supported().into_iter().map(String::from).collect(),
+        }));
+        let maker_features = match conn.recv() {
+            Ok(MakerToTakerMessage::Hello(hello)) => hello.features,
+            other => panic!("expected Hello, got {:?}", other),
+        };
+        details.features = choose_pins(protocol.feature_name(), &maker_features);
         conn.send(&TakerToMakerMessage::GetOffer(GetOffer));
         match conn.recv() {
             Ok(MakerToTakerMessage::Offer(_)) => {}
             other => panic!("expected Offer, got {:?}", other),
         }
-        conn.send(&TakerToMakerMessage::SwapDetails(details.clone()));
+        conn.send(&TakerToMakerMessage::SwapDetails(details));
         match conn.recv() {
             Ok(MakerToTakerMessage::AckSwapDetails(ack)) if ack.tweakable_point.is_some() => {
                 (conn, ack)

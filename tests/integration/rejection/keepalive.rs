@@ -254,7 +254,7 @@ fn stale_connection_cannot_drive_a_readmitted_swap(world: &mut World) {
     let swap_id = "11080000deadbeef".to_string();
     let details = SwapDetails {
         id: swap_id.clone(),
-        protocol_version: ProtocolVersion::Legacy,
+        features: Vec::new(),
         amount: Amount::from_sat(500_000),
         tx_count: 1,
         incoming_count: 1,
@@ -266,13 +266,14 @@ fn stale_connection_cannot_drive_a_readmitted_swap(world: &mut World) {
 
     // A is established, so the maker reads it with no deadline until the 60s
     // test read timeout: it stays open across the 30s idle drain below.
-    let (mut stale, _) = RawMakerConnection::admit(&address, &details);
+    let (mut stale, _) =
+        RawMakerConnection::admit(&address, ProtocolVersion::Legacy, details.clone());
     wait_for_log(
         &log_path,
         &format!("Released idle unfunded swap {swap_id}"),
         Duration::from_secs(50),
     );
-    let (_fresh, _) = RawMakerConnection::admit(&address, &details);
+    let (_fresh, _) = RawMakerConnection::admit(&address, ProtocolVersion::Legacy, details.clone());
 
     let admission = || {
         let state = maker
